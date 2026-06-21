@@ -12,12 +12,13 @@ import { homedir } from 'node:os';
 import { join, dirname, relative, sep, posix } from 'node:path';
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const ENDPOINT = 'https://api.anthropic.com/v1/design/mcp';
 const PROTOCOL_VERSION = '2025-06-18';
 const READ_CAP = 256 * 1024; // 256 KiB
-const CLIENT = { name: 'claude-design', version: '0.1.0' };
+const CLIENT = { name: 'claude-design', version: '0.1.1' };
 
 // ---------------------------------------------------------------------------
 // OAuth — standalone design login.
@@ -1291,7 +1292,15 @@ async function main() {
 
 // Only run the CLI when executed directly — importing this module (e.g. from
 // tests) must NOT trigger main().
-const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
+//
+// When installed globally (npx / npm i -g / any bin-symlink), process.argv[1]
+// is the symlink path while import.meta.url is the resolved real file URL.
+// Resolving the symlink on argv[1] via realpathSync makes the comparison
+// reliable regardless of how the binary was invoked.
+let isMain = false;
+try {
+  isMain = import.meta.url === pathToFileURL(realpathSync(process.argv[1] || '')).href;
+} catch { /* argv[1] missing or unresolvable → not main */ }
 if (isMain) {
   main().catch((e) => {
     fail(`unexpected error: ${e && e.stack ? e.stack : e}`);
