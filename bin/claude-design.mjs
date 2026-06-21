@@ -14,11 +14,12 @@ import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { startServer, printBanner } from './serve.mjs';
 
 const ENDPOINT = 'https://api.anthropic.com/v1/design/mcp';
 const PROTOCOL_VERSION = '2025-06-18';
 const READ_CAP = 256 * 1024; // 256 KiB
-const CLIENT = { name: 'claude-design', version: '0.1.1' };
+const CLIENT = { name: 'claude-design', version: '0.1.2' };
 
 // ---------------------------------------------------------------------------
 // OAuth — standalone design login.
@@ -1225,6 +1226,50 @@ function cmdLogout() {
 }
 
 // ---------------------------------------------------------------------------
+// Serve command
+// ---------------------------------------------------------------------------
+async function cmdServe(args) {
+  // Parse positional + flags.
+  // Usage: serve <dir> [--port <n>] [--open] [--no-reload]
+  const flags = new Set(args.filter((a) => a.startsWith('-')));
+  const positional = args.filter((a) => !a.startsWith('-') && args[args.indexOf(a) - 1] !== '--port');
+
+  const portIdx = args.indexOf('--port');
+  const portVal = portIdx !== -1 ? Number(args[portIdx + 1]) : 4321;
+  const port = Number.isFinite(portVal) && portVal >= 0 ? portVal : 4321;
+
+  const openBrowser = flags.has('--open');
+  const reload = !flags.has('--no-reload');
+
+  const dir = positional[0];
+  if (!dir) fail('usage: claude-design serve <dir> [--port <n>] [--open] [--no-reload]', EXIT.usage);
+
+  const { existsSync: existsSyncLocal, statSync: statSyncLocal } = await import('node:fs');
+  if (!existsSyncLocal(dir)) fail(`directory not found: ${dir}`, EXIT.usage);
+  if (!statSyncLocal(dir).isDirectory()) fail(`not a directory: ${dir}`, EXIT.usage);
+
+  let srv;
+  try {
+    srv = await startServer(dir, { port, reload, open: openBrowser });
+  } catch (e) {
+    if (e.code === 'EADDRINUSE') fail(`port ${port} is already in use — pick another with --port`, 1);
+    throw e;
+  }
+
+  printBanner(dir, srv.port, reload);
+
+  // Block until Ctrl-C.
+  await new Promise(() => {
+    process.on('SIGINT', () => {
+      srv.close().then(() => process.exit(0));
+    });
+    process.on('SIGTERM', () => {
+      srv.close().then(() => process.exit(0));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // CLI dispatch
 // ---------------------------------------------------------------------------
 const USAGE = `claude-design — inference-free design-asset sync (UNOFFICIAL)
@@ -1241,6 +1286,8 @@ Usage:
   claude-design pull <project_id> <dir>       Mirror a project DOWN into <dir>
   claude-design push <project_id> <dir>       Mirror <dir> UP to a project
   claude-design create <name>                 Create a new project
+  claude-design serve <dir> [--port <n>] [--open] [--no-reload]
+                                              Serve <dir> over HTTP with live-reload (default port 4321)
 
 Agent login flow:
   1. run \`claude-design login\` -> it prints an authorize URL + a login id and returns.
@@ -1278,6 +1325,9 @@ async function main() {
       break;
     case 'create':
       await cmdCreate(args[0]);
+      break;
+    case 'serve':
+      await cmdServe(args);
       break;
     case undefined:
     case '-h':

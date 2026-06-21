@@ -166,6 +166,37 @@ claude-design create "My New Project"
 # { "project_id": "...", "url": "..." }
 ```
 
+### Serve a pulled project locally (with live-reload)
+
+A pulled Claude Design project can't be opened as `file://` — its HTML loads
+screens via `<script type="text/babel" src="screens/*.jsx">` and
+Babel-standalone XHR-fetches those local `.jsx` files, which Chrome blocks
+under `file://`. `serve` closes the loop: `pull` → `serve` → view + live-edit.
+
+```bash
+claude-design serve ./design/onboarding
+# http://localhost:4321
+#   http://localhost:4321/TinyTill%20Screens.html
+# serving ./design/onboarding (live-reload on) — press Ctrl-C to stop
+```
+
+- **Default port is `4321`.** Override with `--port <n>`; `--port 0` lets the OS
+  pick a free port (the actual port is always printed).
+- **No auto-open** by default (agent-friendly — the agent surfaces the URL).
+  Pass `--open` to launch the default browser.
+- **Live-reload is on by default.** The server watches `<dir>` recursively and
+  pushes an SSE reload event to every connected browser tab when any file
+  changes. Pass `--no-reload` to disable it.
+- **Zero runtime dependencies.** Uses only Node built-ins (`http`, `fs`, `path`).
+- **Path-traversal safe.** Requests that escape `<dir>` are rejected with `403`.
+- Serves the correct `Content-Type` for `.html`, `.css`, `.js`, `.mjs`, `.jsx`,
+  `.json`, `.svg`, `.png`, `.jpg`, `.gif`, `.webp`, and falls back to
+  `application/octet-stream`.
+
+```
+claude-design serve <dir> [--port <n>] [--open] [--no-reload]
+```
+
 ## Limitations
 
 - **Text only — binary files do not round-trip.** The endpoint can only mirror
