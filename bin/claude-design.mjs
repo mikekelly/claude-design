@@ -3,18 +3,59 @@
 // Claude Code's (undocumented) Design MCP endpoint. No LLM, no subagents.
 //
 // UNOFFICIAL / UNSUPPORTED: this drives an undocumented endpoint. See README.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync,
-  rmSync,
+  rmSync, openSync, closeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, relative, sep, posix } from 'node:path';
+import { createServer } from 'node:http';
+import { createHash, randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const ENDPOINT = 'https://api.anthropic.com/v1/design/mcp';
 const PROTOCOL_VERSION = '2025-06-18';
 const READ_CAP = 256 * 1024; // 256 KiB
 const CLIENT = { name: 'claude-design', version: '0.1.0' };
+
+// ---------------------------------------------------------------------------
+// OAuth — standalone design login.
+//
+// These are PUBLIC PKCE client identifiers (no client secret). The "design"
+// client + claude.com authorize host grant the user:design:* scopes that the
+// /v1/design/mcp endpoint requires. Reverse-engineered & verified; used here so
+// the CLI can mint its own token instead of borrowing Claude Code's.
+//
+// NOTE on impersonation/ToS: this presents as Anthropic's first-party design
+// OAuth client. It is unofficial and unsupported (see README disclaimer).
+// ---------------------------------------------------------------------------
+const AUTH = {
+  clientId: '59637612-477b-4836-a601-b0589eda7704',
+  authorizeUrl: 'https://claude.com/cai/oauth/authorize',
+  // CLAUDE_DESIGN_TOKEN_URL exists only as a test seam (point the token
+  // endpoint at a local stub); production never sets it.
+  tokenUrl: process.env.CLAUDE_DESIGN_TOKEN_URL || 'https://platform.claude.com/v1/oauth/token',
+  scopes: 'user:design:read user:design:write',
+  // Loopback success page + manual (paste) redirect target.
+  successUrl: 'https://platform.claude.com/oauth/code/success?app=claude-code',
+  manualRedirectUri: 'https://platform.claude.com/oauth/code/callback',
+};
+
+// Background listener self-timeout (ms) and a safety skew for expiry checks.
+const LISTENER_TIMEOUT_MS = 5 * 60 * 1000; // ~5 min
+const EXPIRY_SKEW_MS = 30 * 1000; // refresh slightly before real expiry
+const TOKEN_HTTP_TIMEOUT_MS = 30 * 1000;
+
+// Distinct exit codes the polling agent relies on. Keep STABLE.
+const EXIT = {
+  ok: 0,
+  error: 1, // generic failure
+  usage: 2, // bad usage (matches existing push/pull cap-fail convention)
+  notAuthenticated: 4, // a command needs auth but no valid token is available
+  authPending: 10, // auth-check: listener still waiting
+  authFailed: 20, // auth-check: failed / timed out / no login in progress
+};
 
 // Files that are tool-managed artifacts on the design side: never mirror down,
 // never delete up.
@@ -35,9 +76,252 @@ function contractDrift(detail) {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth: PKCE + authorize URL (pure, no I/O)
+// ---------------------------------------------------------------------------
+function base64url(buf) {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function makePkce() {
+  const verifier = base64url(randomBytes(32));
+  const challenge = base64url(createHash('sha256').update(verifier).digest());
+  const state = base64url(randomBytes(32));
+  return { verifier, challenge, state };
+}
+
+function buildAuthorizeUrl({ challenge, state, redirectUri }) {
+  const u = new URL(AUTH.authorizeUrl);
+  u.searchParams.set('code', 'true');
+  u.searchParams.set('client_id', AUTH.clientId);
+  u.searchParams.set('response_type', 'code');
+  u.searchParams.set('redirect_uri', redirectUri);
+  u.searchParams.set('scope', AUTH.scopes);
+  u.searchParams.set('code_challenge', challenge);
+  u.searchParams.set('code_challenge_method', 'S256');
+  u.searchParams.set('state', state);
+  return u.toString();
+}
+
+// ---------------------------------------------------------------------------
+// OAuth: CLI-owned token + login-status storage
+// Layout under ~/.config/claude-design/:
+//   credentials.json  -> { designOauth: { accessToken, refreshToken, expiresAt, scopes } }
+//   login-status.json -> { status, ... } the detached listener writes; auth-check reads
+// ---------------------------------------------------------------------------
+function configDir({ home = homedir() } = {}) {
+  return join(home, '.config', 'claude-design');
+}
+function credentialsPath(opts) {
+  return join(configDir(opts), 'credentials.json');
+}
+function statusPath(opts) {
+  return join(configDir(opts), 'login-status.json');
+}
+
+function writeOwnToken(rec, opts) {
+  const dir = configDir(opts);
+  mkdirSync(dir, { recursive: true });
+  const path = credentialsPath(opts);
+  // Create with 0600 from the start (openSync mode), then write.
+  const fd = openSync(path, 'w', 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify({ designOauth: rec }, null, 2));
+  } finally {
+    closeSync(fd);
+  }
+  return path;
+}
+
+function readOwnToken(opts) {
+  const path = credentialsPath(opts);
+  if (!existsSync(path)) return null;
+  try {
+    const blob = JSON.parse(readFileSync(path, 'utf8'));
+    const rec = blob && blob.designOauth;
+    if (rec && typeof rec.accessToken === 'string') return rec;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function clearOwnToken(opts) {
+  const path = credentialsPath(opts);
+  if (existsSync(path)) rmSync(path, { force: true });
+}
+
+function writeLoginStatus(rec, opts) {
+  const dir = configDir(opts);
+  mkdirSync(dir, { recursive: true });
+  const path = statusPath(opts);
+  const fd = openSync(path, 'w', 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(rec, null, 2));
+  } finally {
+    closeSync(fd);
+  }
+  return path;
+}
+
+function readLoginStatus(opts) {
+  const path = statusPath(opts);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function clearLoginStatus(opts) {
+  const path = statusPath(opts);
+  if (existsSync(path)) rmSync(path, { force: true });
+}
+
+function tokenIsExpired(rec) {
+  if (!rec || rec.expiresAt == null) return false; // no expiry info -> assume valid
+  const exp = Number(rec.expiresAt);
+  if (!Number.isFinite(exp)) return false;
+  return exp <= Date.now() + EXPIRY_SKEW_MS;
+}
+
+// Map a stored login-status record to an auth-check {code, line}.
+function classifyAuthCheck(status) {
+  if (!status || !status.status) {
+    return { code: EXIT.authFailed, line: 'auth: no login in progress — run `claude-design login`' };
+  }
+  switch (status.status) {
+    case 'success':
+      return { code: EXIT.ok, line: 'auth: authenticated' };
+    case 'pending':
+      return { code: EXIT.authPending, line: 'auth: pending — open the login URL, then poll again' };
+    case 'failed':
+    default:
+      return {
+        code: EXIT.authFailed,
+        line: `auth: login failed${status.error ? ` (${status.error})` : ''} — run \`claude-design login\``,
+      };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth: token endpoint (exchange + refresh). Content-Type: application/json
+// ONLY — no Authorization/version headers. 30s timeout.
+// ---------------------------------------------------------------------------
+async function tokenRequest(body) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TOKEN_HTTP_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(AUTH.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { _raw: text };
+  }
+  return { status: res.status, data };
+}
+
+function tokenRecordFrom(data, fallbackRefresh) {
+  const expiresIn = Number(data.expires_in);
+  const expiresAt = Number.isFinite(expiresIn) ? Date.now() + expiresIn * 1000 : null;
+  return {
+    accessToken: data.access_token,
+    // If the server omits a new refresh token, keep the old one.
+    refreshToken: data.refresh_token || fallbackRefresh || null,
+    expiresAt,
+    scopes: data.scope || AUTH.scopes,
+  };
+}
+
+async function exchangeCode({ code, redirectUri, verifier, state }) {
+  const { status, data } = await tokenRequest({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    client_id: AUTH.clientId,
+    code_verifier: verifier,
+    state,
+  });
+  if (status >= 400 || !data.access_token) {
+    const detail = data.error_description || data.error || JSON.stringify(data).slice(0, 200);
+    throw new Error(`token exchange failed (HTTP ${status}): ${detail}`);
+  }
+  return tokenRecordFrom(data, null);
+}
+
+// Returns a refreshed token record. Throws a tagged Error('invalid_grant') when
+// the refresh token is no longer valid so callers can require re-login.
+async function refreshToken(rec) {
+  const { status, data } = await tokenRequest({
+    grant_type: 'refresh_token',
+    refresh_token: rec.refreshToken,
+    client_id: AUTH.clientId,
+    scope: AUTH.scopes,
+  });
+  if (data && data.error === 'invalid_grant') {
+    const e = new Error('invalid_grant');
+    e.code = 'invalid_grant';
+    throw e;
+  }
+  if (status >= 400 || !data.access_token) {
+    const detail = data.error_description || data.error || JSON.stringify(data).slice(0, 200);
+    throw new Error(`token refresh failed (HTTP ${status}): ${detail}`);
+  }
+  return tokenRecordFrom(data, rec.refreshToken);
+}
+
+// Resolve a usable access token from the CLI's OWN store, refreshing if needed.
+// Returns the token string, or null when there is no own-token path available
+// (caller then falls back to the Keychain). Throws notAuthenticated on a dead
+// refresh token (invalid_grant) — re-login is genuinely required.
+async function resolveOwnToken(opts) {
+  const rec = readOwnToken(opts);
+  if (!rec) return null;
+  if (!tokenIsExpired(rec)) return rec.accessToken;
+  if (!rec.refreshToken) {
+    failNotAuthenticated('your stored token expired and there is no refresh token');
+  }
+  try {
+    const fresh = await refreshToken(rec);
+    writeOwnToken(fresh, opts);
+    return fresh.accessToken;
+  } catch (e) {
+    if (e.code === 'invalid_grant') {
+      failNotAuthenticated('your stored login expired (refresh rejected: invalid_grant)');
+    }
+    throw e;
+  }
+}
+
+function failNotAuthenticated(why) {
+  fail(
+    `not authenticated — run \`claude-design login\`${why ? `\n  (${why})` : ''}`,
+    EXIT.notAuthenticated,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Auth — read the claude.ai OAuth access token. NEVER print the token value.
 // ---------------------------------------------------------------------------
-function readCredentialBlob() {
+// Read Claude Code's stored OAuth blob (Keychain first, then file). Returns the
+// parsed blob or null — non-fatal, because this is now a FALLBACK behind the
+// CLI's own token store. A malformed file is still surfaced loudly.
+function readKeychainBlob() {
   // macOS Keychain first.
   try {
     const raw = execFileSync(
@@ -59,33 +343,33 @@ function readCredentialBlob() {
       fail(`credentials file ${credPath} is not valid JSON: ${e.message}`);
     }
   }
-  fail(
-    'no claude.ai credentials found (Keychain "Claude Code-credentials" and ' +
-      `${credPath} both unavailable).\n  Run \`claude\` then \`/design-login\` to authenticate.`,
-  );
+  return null;
 }
 
-function getToken() {
-  const blob = readCredentialBlob();
+// Returns a non-expired Keychain token string, or null if unavailable/expired.
+function keychainTokenOrNull() {
+  const blob = readKeychainBlob();
+  if (!blob) return null;
   const oauth = blob.claudeAiOauth || blob;
   const token = oauth && oauth.accessToken;
-  if (!token) {
-    fail(
-      'credentials found but no accessToken inside (expected claudeAiOauth.accessToken).\n' +
-        '  Run `claude` then `/design-login` to (re)authenticate.',
-    );
-  }
+  if (!token) return null;
   if (oauth.expiresAt) {
     const exp = Number(oauth.expiresAt);
-    if (Number.isFinite(exp) && exp <= Date.now()) {
-      fail(
-        'your claude.ai OAuth token has EXPIRED.\n' +
-          '  Re-authenticate by running `claude` and then `/design-login`.\n' +
-          '  (Automatic token refresh is not implemented in v1 — see README limitations.)',
-      );
-    }
+    if (Number.isFinite(exp) && exp <= Date.now()) return null; // expired
   }
   return token;
+}
+
+// Auth precedence:
+//   (1) the CLI's OWN stored token (refresh if expired)
+//   (2) the existing macOS Keychain "Claude Code-credentials" fallback
+//   (3) the "not authenticated — run `claude-design login`" error.
+async function resolveToken(opts) {
+  const own = await resolveOwnToken(opts); // may fail-not-authenticated on invalid_grant
+  if (own) return own;
+  const kc = keychainTokenOrNull();
+  if (kc) return kc;
+  failNotAuthenticated('no stored token and no usable Claude Code credentials');
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +434,7 @@ class Session {
   }
 
   static async open() {
-    const token = getToken();
+    const token = await resolveToken();
     const init = await rpc(token, {
       jsonrpc: '2.0',
       id: 1,
@@ -698,23 +982,253 @@ async function cmdCreate(name) {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth: login / auth-check / logout commands
+//
+// login is a NON-BLOCKING two-step dance for an orchestrating agent:
+//   1. bind a loopback port, persist a "pending" status carrying the PKCE
+//      verifier+state+redirect_uri, then spawn a DETACHED child that re-enters
+//      this same script as `__listen` to run the callback server.
+//   2. print the authorize URL + a one-line instruction and exit 0 immediately.
+// The agent opens the URL, then polls `auth-check` until exit 0/20.
+// ---------------------------------------------------------------------------
+async function cmdLogin(args) {
+  const manual = args.includes('--manual');
+  const codeIdx = args.indexOf('--code');
+  const code = codeIdx !== -1 ? args[codeIdx + 1] : null;
+
+  // login --code <code>: complete a previously-started --manual flow.
+  if (code) {
+    const pending = readLoginStatus();
+    if (!pending || pending.status !== 'pending' || pending.mode !== 'manual') {
+      fail(
+        'no manual login is in progress — run `claude-design login --manual` first',
+        EXIT.usage,
+      );
+    }
+    try {
+      const rec = await exchangeCode({
+        code,
+        redirectUri: pending.redirectUri,
+        verifier: pending.verifier,
+        state: pending.state,
+      });
+      writeOwnToken(rec);
+      writeLoginStatus({ status: 'success', at: Date.now() });
+      console.log('auth: authenticated — token stored');
+      return;
+    } catch (e) {
+      writeLoginStatus({ status: 'failed', error: e.message, at: Date.now() });
+      fail(`login failed: ${e.message}`);
+    }
+  }
+
+  const { verifier, challenge, state } = makePkce();
+
+  if (manual) {
+    const redirectUri = AUTH.manualRedirectUri;
+    const url = buildAuthorizeUrl({ challenge, state, redirectUri });
+    writeLoginStatus({
+      status: 'pending', mode: 'manual', verifier, state, redirectUri, at: Date.now(),
+    });
+    console.log(url);
+    console.log(
+      'Open this URL, approve, copy the code shown, then run: ' +
+        '`claude-design login --code <code>`',
+    );
+    return;
+  }
+
+  // Loopback flow: bind an OS-assigned port FIRST so the redirect_uri is known
+  // before we print the URL, then hand the bound port to a detached listener.
+  const port = await bindLoopbackPort();
+  const redirectUri = `http://localhost:${port}/callback`;
+  const url = buildAuthorizeUrl({ challenge, state, redirectUri });
+
+  // Persist pending state the listener + auth-check both read.
+  writeLoginStatus({
+    status: 'pending', mode: 'loopback', verifier, state, redirectUri, port, at: Date.now(),
+  });
+
+  spawnDetachedListener({ verifier, state, redirectUri, port });
+
+  console.log(url);
+  console.log(
+    'Open this URL in your browser, then poll `claude-design auth-check` ' +
+      '(exit 0 = done, 10 = pending, 20 = failed).',
+  );
+}
+
+// Find a free loopback port by briefly binding :0, then releasing it. There is a
+// tiny race between release and the listener re-binding; acceptable for a local
+// interactive login (the listener fails loudly into status=failed if it can't).
+function bindLoopbackPort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+function spawnDetachedListener({ verifier, state, redirectUri, port }) {
+  const child = spawn(
+    process.execPath,
+    [process.argv[1], '__listen', String(port)],
+    {
+      detached: true,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        CLAUDE_DESIGN_VERIFIER: verifier,
+        CLAUDE_DESIGN_STATE: state,
+        CLAUDE_DESIGN_REDIRECT: redirectUri,
+      },
+    },
+  );
+  child.unref();
+}
+
+// Detached entry point: run the loopback callback server until it gets the
+// callback or self-times-out, then write the resulting login-status record and
+// exit. Never prints to a console the parent reads (stdio is ignored).
+async function cmdListen(portArg) {
+  const port = Number(portArg);
+  const verifier = process.env.CLAUDE_DESIGN_VERIFIER;
+  const state = process.env.CLAUDE_DESIGN_STATE;
+  const redirectUri = process.env.CLAUDE_DESIGN_REDIRECT;
+  if (!port || !verifier || !state || !redirectUri) {
+    writeLoginStatus({ status: 'failed', error: 'listener missing parameters', at: Date.now() });
+    process.exit(EXIT.error);
+  }
+
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = (status) => {
+      if (done) return;
+      done = true;
+      writeLoginStatus({ ...status, at: Date.now() });
+      try {
+        server.close();
+      } catch {
+        /* ignore */
+      }
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const server = createServer(async (req, res) => {
+      const reqUrl = new URL(req.url, redirectUri);
+      if (reqUrl.pathname !== '/callback') {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      const cbCode = reqUrl.searchParams.get('code');
+      const cbState = reqUrl.searchParams.get('state');
+      if (!cbCode || cbState !== state) {
+        res.writeHead(400).end('invalid callback (state mismatch or missing code)');
+        finish({ status: 'failed', error: 'state mismatch or missing code' });
+        return;
+      }
+      // Send the browser to the friendly success page while we exchange.
+      res.writeHead(302, { Location: AUTH.successUrl }).end();
+      try {
+        const rec = await exchangeCode({ code: cbCode, redirectUri, verifier, state });
+        writeOwnToken(rec);
+        finish({ status: 'success' });
+      } catch (e) {
+        finish({ status: 'failed', error: e.message });
+      }
+    });
+
+    server.on('error', (e) => finish({ status: 'failed', error: `listener bind failed: ${e.message}` }));
+    const timer = setTimeout(
+      () => finish({ status: 'failed', error: 'login timed out (no callback within 5 min)' }),
+      LISTENER_TIMEOUT_MS,
+    );
+    server.listen(port, '127.0.0.1');
+  });
+
+  process.exit(EXIT.ok);
+}
+
+// auth-check: read the stored status, refresh a valid token if needed, print one
+// clear line, and exit with the documented code (0 / 10 / 20).
+async function cmdAuthCheck() {
+  const status = readLoginStatus();
+  const verdict = classifyAuthCheck(status);
+  if (verdict.code === EXIT.ok) {
+    // Confirm we still have a usable token (refresh transparently if expired).
+    const rec = readOwnToken();
+    if (!rec) {
+      console.log('auth: login reported success but no token is stored — run `claude-design login`');
+      process.exit(EXIT.authFailed);
+    }
+    if (tokenIsExpired(rec)) {
+      if (!rec.refreshToken) {
+        console.log('auth: token expired and no refresh token — run `claude-design login`');
+        process.exit(EXIT.authFailed);
+      }
+      try {
+        const fresh = await refreshToken(rec);
+        writeOwnToken(fresh);
+      } catch (e) {
+        console.log(`auth: token refresh failed (${e.message}) — run \`claude-design login\``);
+        process.exit(EXIT.authFailed);
+      }
+    }
+  }
+  console.log(verdict.line);
+  process.exit(verdict.code);
+}
+
+function cmdLogout() {
+  clearOwnToken();
+  clearLoginStatus();
+  console.log('auth: logged out — stored token and any pending login cleared');
+}
+
+// ---------------------------------------------------------------------------
 // CLI dispatch
 // ---------------------------------------------------------------------------
 const USAGE = `claude-design — inference-free design-asset sync (UNOFFICIAL)
 
 Usage:
+  claude-design login                         Start OAuth login (non-blocking; prints URL)
+  claude-design login --manual                Headless/SSH login (prints URL to paste a code)
+  claude-design login --code <code>           Complete a --manual login with the pasted code
+  claude-design auth-check                     Poll login status (exit 0=ok, 10=pending, 20=failed)
+  claude-design logout                        Clear the CLI's stored token + pending login
   claude-design list                          List your design projects (id + name)
   claude-design pull <project_id> <dir>       Mirror a project DOWN into <dir>
   claude-design push <project_id> <dir>       Mirror <dir> UP to a project
   claude-design create <name>                 Create a new project
 
-Auth: reads your claude.ai OAuth token from the macOS Keychain
-("Claude Code-credentials") or ~/.claude/.credentials.json. Authenticate once
-by running \`claude\` then \`/design-login\`.`;
+Agent login flow:
+  1. run \`claude-design login\` -> it prints an authorize URL and returns immediately.
+  2. open that URL in a browser and complete sign-in.
+  3. poll \`claude-design auth-check\` until it exits 0 (done) or 20 (failed/timeout).
+
+Auth precedence: the CLI's own stored token (auto-refreshed) -> the macOS
+Keychain "Claude Code-credentials" fallback. Token stored at
+~/.config/claude-design/credentials.json (mode 0600). Tokens are never printed.`;
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   switch (cmd) {
+    case 'login':
+      await cmdLogin(args);
+      break;
+    case 'auth-check':
+      await cmdAuthCheck();
+      break;
+    case 'logout':
+      cmdLogout();
+      break;
+    case '__listen': // internal: detached loopback callback server
+      await cmdListen(args[0]);
+      break;
     case 'list':
       await cmdList();
       break;
@@ -734,10 +1248,31 @@ async function main() {
       console.log(USAGE);
       break;
     default:
-      fail(`unknown command: ${cmd}\n\n${USAGE}`);
+      fail(`unknown command: ${cmd}\n\n${USAGE}`, EXIT.usage);
   }
 }
 
-main().catch((e) => {
-  fail(`unexpected error: ${e && e.stack ? e.stack : e}`);
-});
+// Only run the CLI when executed directly — importing this module (e.g. from
+// tests) must NOT trigger main().
+const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
+if (isMain) {
+  main().catch((e) => {
+    fail(`unexpected error: ${e && e.stack ? e.stack : e}`);
+  });
+}
+
+// Exports for tests (pure/verifiable pieces + storage helpers).
+export {
+  AUTH,
+  EXIT,
+  base64url,
+  makePkce,
+  buildAuthorizeUrl,
+  readOwnToken,
+  writeOwnToken,
+  clearOwnToken,
+  tokenIsExpired,
+  classifyAuthCheck,
+  exchangeCode,
+  refreshToken,
+};

@@ -6,6 +6,9 @@
   "bin": {
     "claude-design": "bin/claude-design.mjs"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "files": [
     "bin/",
     "README.md",

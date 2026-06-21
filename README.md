@@ -37,18 +37,75 @@ npx claude-design list
 
 Requires **Node ≥ 18** (uses built-in `fetch`). Zero runtime dependencies.
 
-## Auth prerequisite
+## Auth
 
-You need a `claude.ai` login **with design access**. Authenticate once:
+You need a `claude.ai` login **with design access**. There are two ways to get a
+token; the CLI tries them in this order:
+
+1. **The CLI's own OAuth login** (`claude-design login`) — recommended. Stores a
+   token at `~/.config/claude-design/credentials.json` (mode `0600`) and
+   **auto-refreshes** it when it expires.
+2. **Claude Code's existing token** — the macOS **Keychain** entry
+   `Claude Code-credentials`, falling back to `~/.claude/.credentials.json`. This
+   fallback is unchanged: if you've already run `claude` + `/design-login`, the
+   sync commands work without a separate `claude-design login`.
+
+**The CLI never prints or logs token values.**
+
+> ### ⚠️ Standalone login presents as Anthropic's first-party design client
+>
+> `claude-design login` performs an OAuth PKCE flow against Anthropic's design
+> OAuth client (a **public** client id — no secret). It therefore **presents as
+> a first-party Anthropic client** even though this tool is **unofficial and
+> unsupported**. Using a first-party service through an unofficial client may be
+> a **ToS gray area** — use at your own risk. Prefer the Keychain fallback (auth
+> via the official `claude` / `/design-login`) if you'd rather not run the
+> standalone login.
+
+### Logging in (agent-friendly, non-blocking poll flow)
+
+`login` is built for an AI agent to orchestrate. It does **not** block waiting
+for the browser — it returns the authorize URL immediately and runs the callback
+listener in a detached background process. The agent then polls `auth-check`:
 
 ```bash
-claude            # start Claude Code
-/design-login     # then run this slash command to log in to the design service
+# 1. Start login — prints an authorize URL and returns immediately (exit 0).
+claude-design login
+#   https://claude.com/cai/oauth/authorize?...   <- open this in a browser
+#   Open this URL ... then poll `claude-design auth-check` ...
+
+# 2. Open the URL, sign in. Meanwhile, poll auth-check until it stops being pending:
+claude-design auth-check        # exit 10 = pending, 0 = authenticated, 20 = failed/timeout
 ```
 
-The CLI reads your token from the macOS **Keychain** entry
-`Claude Code-credentials`, falling back to `~/.claude/.credentials.json` on
-other platforms. **It never prints or logs your token.**
+`auth-check` is designed to be polled in a loop (with the agent's own timeout)
+until it returns `0` or `20`. It also transparently refreshes the stored token
+if it has expired. The detached listener self-times-out after ~5 minutes.
+
+**Exit codes:**
+
+| Command / situation                         | Exit | Meaning                                  |
+| ------------------------------------------- | ---- | ---------------------------------------- |
+| `auth-check` — authenticated (token valid)  | `0`  | done                                     |
+| `auth-check` — listener still waiting       | `10` | pending — keep polling                   |
+| `auth-check` — failed / timed out / no login| `20` | failed — re-run `claude-design login`    |
+| any sync command — no valid token available | `4`  | not authenticated — run `... login`      |
+
+### Manual (headless / SSH) login
+
+If there's no browser on the same host for the loopback callback, use the paste
+fallback:
+
+```bash
+claude-design login --manual         # prints a URL; sign in, copy the shown code
+claude-design login --code <code>    # complete the login with that code
+```
+
+### Logging out
+
+```bash
+claude-design logout                 # clears the CLI's stored token + any pending login
+```
 
 ## Usage
 
@@ -110,9 +167,13 @@ claude-design create "My New Project"
   caps file bodies at 256 KiB. Larger files are reported and skipped rather than
   silently truncated. (Server-side `copy_files` could move large assets but is
   not wired up in this v1.)
-- **No token refresh yet.** If your OAuth token has expired, the CLI fails with
-  a clear message — re-authenticate by running `claude` and `/design-login`. It
-  does not attempt an automatic refresh in v1.
+- **Token refresh:** a token obtained via `claude-design login` is
+  **auto-refreshed** transparently before each call when it has expired (using
+  its refresh token). If the refresh token itself is rejected (`invalid_grant`),
+  the CLI fails with a clear "run `claude-design login`" message. The **Keychain
+  fallback** token (from `claude` / `/design-login`) is **not** refreshed by this
+  CLI — if it has expired, re-authenticate via `claude` and `/design-login`, or
+  switch to `claude-design login`.
 - **macOS-Keychain-first.** Token discovery prefers the macOS Keychain, then
   `~/.claude/.credentials.json`. Other secure stores are not consulted.
 - **Undocumented contract.** See the disclaimer above — the endpoint and tool
