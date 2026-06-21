@@ -179,6 +179,10 @@ export function startServer(dir, opts = {}) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
       });
+      // Flush headers immediately so the client's EventSource 'open' fires on
+      // connect rather than waiting for the first body write (the 20s heartbeat).
+      res.flushHeaders();
+      res.write(':ok\n\n');
       // Heartbeat every 20s to prevent proxy timeouts.
       const heartbeat = setInterval(() => {
         try { res.write(':ping\n\n'); } catch { clearInterval(heartbeat); }

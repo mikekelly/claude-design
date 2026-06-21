@@ -279,3 +279,42 @@ test('missing file returns 404', async () => {
     await close();
   }
 });
+
+// Regression test: SSE headers must be flushed PROMPTLY on bare connect — within
+// ~1 s, without waiting for a file change or the 20 s heartbeat. Without
+// res.flushHeaders() / res.write(':ok\n\n') after writeHead, Node holds the
+// headers in its buffer until the first body write, so 'response' never fires
+// within the 1 s window and this test fails.
+test('/__livereload flushes headers promptly on bare connect (no file change, <1s)', async () => {
+  const dir = makeFixtureDir();
+  const { close, port } = await startServer(dir, { port: 0, reload: true });
+  try {
+    const result = await new Promise((resolve, reject) => {
+      // Reject if no response arrives within 1 s.
+      const deadline = setTimeout(
+        () => reject(new Error('headers not received within 1000ms — server did not flush on connect')),
+        1000,
+      );
+      const req = httpGet(`http://127.0.0.1:${port}/__livereload`, (res) => {
+        clearTimeout(deadline);
+        // Grab headers then immediately kill the socket — we don't want to read
+        // the endless SSE body.
+        const { statusCode, headers } = res;
+        req.destroy();
+        resolve({ statusCode, contentType: headers['content-type'] });
+      });
+      req.on('error', (e) => {
+        // destroy() triggers ECONNRESET — ignore it if we already resolved.
+        if (e.code === 'ECONNRESET' || e.code === 'ERR_HTTP_REQUEST_TIMEOUT') return;
+        reject(e);
+      });
+    });
+    assert.equal(result.statusCode, 200, `expected 200, got ${result.statusCode}`);
+    assert.ok(
+      result.contentType?.includes('text/event-stream'),
+      `expected text/event-stream, got ${result.contentType}`,
+    );
+  } finally {
+    await close();
+  }
+});
