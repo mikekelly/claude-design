@@ -24,5 +24,13 @@
     "mcp",
     "sync",
     "cli"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikekelly/claude-design.git"
+  },
+  "homepage": "https://github.com/mikekelly/claude-design#readme",
+  "bugs": {
+    "url": "https://github.com/mikekelly/claude-design/issues"
+  }
 }
