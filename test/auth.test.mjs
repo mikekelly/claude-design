@@ -10,13 +10,16 @@ import { join } from 'node:path';
 import {
   base64url,
   makePkce,
+  makeLoginId,
   buildAuthorizeUrl,
   AUTH,
   readOwnToken,
   writeOwnToken,
   clearOwnToken,
+  readPending,
+  writePending,
+  clearPending,
   tokenIsExpired,
-  classifyAuthCheck,
 } from '../bin/claude-design.mjs';
 
 // --- PKCE / state ----------------------------------------------------------
@@ -39,6 +42,13 @@ test('makePkce challenge is the real S256 of the verifier', async () => {
   const { verifier, challenge } = makePkce();
   const expected = base64url(createHash('sha256').update(verifier).digest());
   assert.equal(challenge, expected);
+});
+
+test('makeLoginId is 8 lowercase hex chars and varies', () => {
+  const a = makeLoginId();
+  const b = makeLoginId();
+  assert.match(a, /^[0-9a-f]{8}$/, `expected 8 hex chars, got ${a}`);
+  assert.notEqual(a, b);
 });
 
 // --- authorize URL ---------------------------------------------------------
@@ -119,10 +129,37 @@ test('tokenIsExpired treats a near-expiry token (within skew) as expired', () =>
   assert.equal(tokenIsExpired({ expiresAt: Date.now() + 10_000 }), true);
 });
 
-// --- auth-check classification (no I/O) ------------------------------------
-test('classifyAuthCheck maps states to documented exit codes', () => {
-  assert.equal(classifyAuthCheck({ status: 'success' }).code, 0);
-  assert.equal(classifyAuthCheck({ status: 'pending' }).code, 10);
-  assert.equal(classifyAuthCheck({ status: 'failed' }).code, 20);
-  assert.equal(classifyAuthCheck(null).code, 20); // no login in progress
+// --- pending-login record storage ------------------------------------------
+test('writePending / readPending round-trip and file is mode 0600', () => {
+  withTempHome((home) => {
+    const rec = {
+      id: 'abcd1234',
+      verifier: 'VER',
+      state: 'ST',
+      port: 54321,
+      redirect_uri: 'http://localhost:54321/callback',
+      manual: false,
+      createdAt: 1,
+    };
+    const path = writePending(rec, { home });
+    assert.ok(existsSync(path));
+    const mode = statSync(path).mode & 0o777;
+    assert.equal(mode, 0o600, `expected 0600 got ${mode.toString(8)}`);
+    assert.deepEqual(readPending({ home }), rec);
+  });
+});
+
+test('readPending returns null when no pending file exists', () => {
+  withTempHome((home) => {
+    assert.equal(readPending({ home }), null);
+  });
+});
+
+test('clearPending removes the pending file (idempotent)', () => {
+  withTempHome((home) => {
+    writePending({ id: 'x', manual: true }, { home });
+    clearPending({ home });
+    assert.equal(readPending({ home }), null);
+    clearPending({ home }); // no-op, must not throw
+  });
 });

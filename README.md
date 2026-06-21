@@ -1,31 +1,33 @@
 # claude-design
 
-A tiny, dependency-free CLI to **sync design assets to and from Claude's design
-service** (`claude.ai/design`) deterministically — no LLM in the loop. It mirrors
-a design project down to a local directory and pushes local changes back up,
-byte-faithfully.
+## Why this exists
+
+Claude Design sync normally runs *through an LLM agent* (the DesignSync tool, or
+`claude -p`) — putting model inference in the critical path of every pull/push:
+slow, costly, non-deterministic, and killable on long runs. `claude-design`
+exposes the same sync as plain deterministic commands, so **scripts, CI,
+Makefiles, and git hooks can manage syncing with zero inference in the loop.**
+The agent decides *what* to sync; the CLI does the transport.
+
+It mirrors a `claude.ai/design` project down to a local directory and pushes
+local changes back up, byte-faithfully, speaking the design MCP wire protocol
+directly — no model in the loop.
 
 ---
 
 > ## ⚠️ Unofficial, undocumented, unsupported
 >
 > This is **not affiliated with, endorsed by, or supported by Anthropic.** It
-> drives an **undocumented** server-side MCP endpoint by reusing your local
-> `claude.ai` OAuth token. That endpoint can **change or disappear without
-> notice**, which will break this tool. Using a first-party service through an
-> unofficial client may also be a **ToS gray area** — use at your own risk. If
-> the endpoint's contract changes, the CLI is designed to **fail loudly** rather
+> drives an **undocumented** server-side MCP endpoint, and `claude-design login`
+> performs an OAuth flow against Anthropic's **first-party** design OAuth client
+> (a public PKCE client id — no secret), so it **presents as a first-party
+> client** even though it is unofficial. That endpoint can **change or disappear
+> without notice**, which will break this tool. Using a first-party service
+> through an unofficial client may also be a **ToS gray area** — use at your own
+> risk. If the contract changes, the CLI is designed to **fail loudly** rather
 > than corrupt your files, but it will need updating.
 
 ---
-
-## What it does
-
-It speaks the MCP wire protocol (streamable HTTP) directly against the design
-endpoint, authenticating with the OAuth token Claude Code already stored on your
-machine. There is **no model inference** — every operation is a deterministic
-file diff/copy. It is meant for keeping a repo's design-reference directory in
-exact sync with its canonical `claude.ai/design` project.
 
 ## Install
 
@@ -39,57 +41,48 @@ Requires **Node ≥ 18** (uses built-in `fetch`). Zero runtime dependencies.
 
 ## Auth
 
-You need a `claude.ai` login **with design access**. There are two ways to get a
-token; the CLI tries them in this order:
+You need a `claude.ai` login **with design access**. There are two token sources;
+the CLI tries them in this order:
 
 1. **The CLI's own OAuth login** (`claude-design login`) — recommended. Stores a
    token at `~/.config/claude-design/credentials.json` (mode `0600`) and
    **auto-refreshes** it when it expires.
 2. **Claude Code's existing token** — the macOS **Keychain** entry
-   `Claude Code-credentials`, falling back to `~/.claude/.credentials.json`. This
-   fallback is unchanged: if you've already run `claude` + `/design-login`, the
-   sync commands work without a separate `claude-design login`.
+   `Claude Code-credentials`, falling back to `~/.claude/.credentials.json`. If
+   you've already run `claude` + `/design-login`, the sync commands work without
+   a separate `claude-design login`.
 
 **The CLI never prints or logs token values.**
 
-> ### ⚠️ Standalone login presents as Anthropic's first-party design client
->
-> `claude-design login` performs an OAuth PKCE flow against Anthropic's design
-> OAuth client (a **public** client id — no secret). It therefore **presents as
-> a first-party Anthropic client** even though this tool is **unofficial and
-> unsupported**. Using a first-party service through an unofficial client may be
-> a **ToS gray area** — use at your own risk. Prefer the Keychain fallback (auth
-> via the official `claude` / `/design-login`) if you'd rather not run the
-> standalone login.
+### Logging in (stateless `login` → blocking `monitor-auth`)
 
-### Logging in (agent-friendly, non-blocking poll flow)
-
-`login` is built for an AI agent to orchestrate. It does **not** block waiting
-for the browser — it returns the authorize URL immediately and runs the callback
-listener in a detached background process. The agent then polls `auth-check`:
+Login is split into two plain foreground commands — **no background daemon, no
+orphan process.** `login` emits the authorize URL and a short **login id** and
+returns immediately; `monitor-auth <id>` binds the loopback callback port and
+**blocks** until the browser redirect completes. The loopback listener lives
+*only* inside `monitor-auth` — the command the agent is actively awaiting (the
+idiomatic `gh auth login` foreground-loopback pattern, split in two so the URL
+surfaces first).
 
 ```bash
-# 1. Start login — prints an authorize URL and returns immediately (exit 0).
+# 1. Print the authorize URL + a login id, then return (exit 0).
 claude-design login
-#   https://claude.com/cai/oauth/authorize?...   <- open this in a browser
-#   Open this URL ... then poll `claude-design auth-check` ...
+#   https://claude.com/cai/oauth/authorize?...        <- open this in a browser
+#   open this URL to approve, then run `claude-design monitor-auth a1b2c3d4` ...
 
-# 2. Open the URL, sign in. Meanwhile, poll auth-check until it stops being pending:
-claude-design auth-check        # exit 10 = pending, 0 = authenticated, 20 = failed/timeout
+# 2. IMMEDIATELY run monitor-auth — it binds the port and BLOCKS until done.
+claude-design monitor-auth a1b2c3d4    # exit 0 = authenticated, 20 = failed/timeout
+#   (now open the URL and sign in; monitor-auth returns when the callback lands)
 ```
 
-`auth-check` is designed to be polled in a loop (with the agent's own timeout)
-until it returns `0` or `20`. It also transparently refreshes the stored token
-if it has expired. The detached listener self-times-out after ~5 minutes.
+> **Ordering rule (agents):** run `monitor-auth` *immediately* after surfacing
+> the URL, so the loopback port is already listening before the user clicks
+> approve. `monitor-auth` blocks (default ~300s; override with `--timeout <sec>`
+> or `CLAUDE_DESIGN_MONITOR_TIMEOUT=<sec>`) — an agent simply awaits it.
 
-**Exit codes:**
-
-| Command / situation                         | Exit | Meaning                                  |
-| ------------------------------------------- | ---- | ---------------------------------------- |
-| `auth-check` — authenticated (token valid)  | `0`  | done                                     |
-| `auth-check` — listener still waiting       | `10` | pending — keep polling                   |
-| `auth-check` — failed / timed out / no login| `20` | failed — re-run `claude-design login`    |
-| any sync command — no valid token available | `4`  | not authenticated — run `... login`      |
+If the port can't be bound when `monitor-auth` starts (a rare race — another
+process grabbed it after `login` released it), it exits `20` with a clear
+"re-run login" message.
 
 ### Manual (headless / SSH) login
 
@@ -101,11 +94,30 @@ claude-design login --manual         # prints a URL; sign in, copy the shown cod
 claude-design login --code <code>    # complete the login with that code
 ```
 
-### Logging out
+### Check / clear auth
 
 ```bash
-claude-design logout                 # clears the CLI's stored token + any pending login
+claude-design whoami    # instant, non-blocking: exit 0 = authed, 4 = not authed
+claude-design logout    # clears the CLI's stored token + any pending login
 ```
+
+`whoami` reads the stored token (refreshing it if expired) and prints one line —
+`authenticated[ as <account>]`, `expired`, or `not authenticated` — and **never**
+the token value.
+
+### Exit codes
+
+| Command / situation                                   | Exit | Meaning                                  |
+| ----------------------------------------------------- | ---- | ---------------------------------------- |
+| `login` — URL + id emitted                            | `0`  | done (now run `monitor-auth`)            |
+| `monitor-auth` / `login --code` — authenticated       | `0`  | token stored                             |
+| `monitor-auth` — timed out / bad state / port unavail | `20` | failed — re-run `claude-design login`    |
+| `login --code` — no manual login in progress          | `2`  | usage error                              |
+| `whoami` — authenticated                              | `0`  | a usable token is available              |
+| `whoami` — not authenticated / expired                | `4`  | run `claude-design login`                |
+| any sync command — no valid token available           | `4`  | not authenticated — run `... login`      |
+| any command — bad usage                               | `2`  | usage error                              |
+| any command — generic failure / contract drift        | `1` / `3` | failure (see message)               |
 
 ## Usage
 
@@ -174,8 +186,10 @@ claude-design create "My New Project"
   fallback** token (from `claude` / `/design-login`) is **not** refreshed by this
   CLI — if it has expired, re-authenticate via `claude` and `/design-login`, or
   switch to `claude-design login`.
-- **macOS-Keychain-first.** Token discovery prefers the macOS Keychain, then
-  `~/.claude/.credentials.json`. Other secure stores are not consulted.
+- **macOS-Keychain-first fallback.** Token discovery prefers the CLI's own token,
+  then the macOS Keychain, then `~/.claude/.credentials.json`. Other secure
+  stores are not consulted. (The `security` CLI resolves the login keychain
+  relative to `$HOME`.)
 - **Undocumented contract.** See the disclaimer above — the endpoint and tool
   schemas are not a public API.
 
