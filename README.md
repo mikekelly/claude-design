@@ -39,6 +39,10 @@ npx claude-design list
 
 Requires **Node ≥ 18** (uses built-in `fetch`). Zero runtime dependencies.
 
+> The command examples below are written as `claude-design …` for brevity. If you
+> haven't installed it globally (`npm i -g claude-design`), prefix each with
+> `npx ` — e.g. `npx claude-design list`.
+
 ## Auth
 
 You need a `claude.ai` login **with design access**. There are two token sources;
