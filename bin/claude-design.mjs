@@ -206,7 +206,11 @@ class Session {
     }
   }
 
-  async call(name, args) {
+  // call() fails loudly on a tool error by default. Pass { allowError: true }
+  // to instead return { isError: true, message } so the caller can handle a
+  // per-item error (e.g. read_file refusing a binary file) without aborting a
+  // whole mirror.
+  async call(name, args, { allowError = false } = {}) {
     const r = await rpc(
       this.token,
       {
@@ -227,6 +231,7 @@ class Session {
     if (r.data.error) {
       // JSON-RPC error from the server — surface it loudly.
       const err = r.data.error;
+      if (allowError) return { isError: true, message: err.message || JSON.stringify(err) };
       fail(`server error from ${name}: ${err.message || JSON.stringify(err)} (code ${err.code})`);
     }
     const result = r.data.result;
@@ -235,6 +240,7 @@ class Session {
     }
     if (result.isError) {
       const txt = extractText(result);
+      if (allowError) return { isError: true, message: txt };
       fail(`tool ${name} reported an error: ${txt}`);
     }
     return result;
@@ -434,6 +440,24 @@ function isProtectedLocal(relPath) {
   return PROTECTED_BASENAMES.includes(base);
 }
 
+// The design endpoint can only round-trip text. read_file refuses to return
+// binary files at all ("…is a binary file (stored base64); read_file only
+// returns text content"), and write_files rejects unrecognized binary content
+// types (e.g. application/octet-stream). A file round-trips iff its bytes are
+// valid UTF-8 — that is exactly what the server stores and re-serves as text.
+// Anything else is NOT mirrorable through this endpoint, so we exclude it from
+// pushes and report it on pulls rather than pretend.
+function isRoundTrippableText(buf) {
+  return Buffer.from(buf.toString('utf8'), 'utf8').equals(buf);
+}
+
+// Does a read_file error message indicate the file is binary (and so cannot be
+// returned by this endpoint at all)? Matched loosely so a minor wording change
+// upstream still triggers the graceful-skip path rather than a hard crash.
+function isBinaryReadError(message) {
+  return typeof message === 'string' && /binary file/i.test(message);
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -465,10 +489,25 @@ async function cmdPull(projectId, dir) {
 
   const remotePaths = (await listAllFiles(session, projectId)).filter((p) => !shouldSkip(p));
   const oversize = [];
+  const binary = [];
   let pulled = 0;
 
   for (const path of remotePaths) {
-    const result = await session.call('read_file', { project_id: projectId, path });
+    const result = await session.call(
+      'read_file',
+      { project_id: projectId, path },
+      { allowError: true },
+    );
+    if (result.isError) {
+      // The endpoint refuses to return binary files; that is a permanent
+      // limitation, not corruption. Skip-and-report rather than aborting the
+      // whole pull (real projects contain images/fonts alongside text).
+      if (isBinaryReadError(result.message)) {
+        binary.push(path);
+        continue;
+      }
+      fail(`read_file failed for ${path}: ${result.message}`);
+    }
     // Detect cap: a 256 KiB file may be truncated. We can't always know the true
     // size, but the server caps at 256 KiB; if we receive exactly the cap of
     // decoded bytes we warn. Better: check a reported size if present.
@@ -500,6 +539,14 @@ async function cmdPull(projectId, dir) {
 
   console.log(`pulled ${pulled} file(s) into ${dir}`);
   if (deleted) console.log(`deleted ${deleted} local file(s) no longer upstream`);
+  if (binary.length) {
+    console.error(
+      `\nNOTE: ${binary.length} binary file(s) could not be pulled — the design ` +
+        'endpoint only returns text content via read_file. They remain in the ' +
+        'project but were not mirrored locally:',
+    );
+    for (const p of binary) console.error(`  ${p}`);
+  }
   if (oversize.length) {
     console.error('\nFAIL: the following file(s) hit the 256 KiB read cap and were NOT written');
     console.error('(read_file cannot return them faithfully — they may be truncated):');
@@ -542,9 +589,19 @@ async function cmdPush(projectId, dir) {
   // Determine writes: added or changed.
   const writes = []; // {path, data(base64)}
   const tooLarge = [];
+  const binary = []; // local files that cannot round-trip through this endpoint
   for (const path of localPaths) {
     const abs = join(dir, ...path.split('/'));
     const bytes = readFileSync(abs);
+    if (!isRoundTrippableText(bytes)) {
+      // Non-UTF-8 bytes are not round-trippable: write_files may reject the
+      // content type outright, and read_file can never return them for
+      // verification. Exclude from the mirror and report — pushing them anyway
+      // would create an unverifiable, divergent state (and one rejected file
+      // aborts the whole atomic write batch).
+      binary.push(path);
+      continue;
+    }
     if (bytes.length >= READ_CAP) {
       // Inline write goes through the same 256 KiB ceiling as read; flag it.
       tooLarge.push({ path, size: bytes.length });
@@ -571,7 +628,22 @@ async function cmdPush(projectId, dir) {
   // tool files (already excluded from remotePaths).
   const deletes = remotePaths.filter((p) => !localSet.has(p));
 
+  const reportBinary = () => {
+    if (!binary.length) return;
+    console.error(
+      `\nNOTE: ${binary.length} non-text file(s) were SKIPPED — the design endpoint ` +
+        'cannot round-trip binary content (write may reject the type, and read_file ' +
+        'never returns it). They were not pushed:',
+    );
+    for (const p of binary) console.error(`  ${p}`);
+  };
+
   if (writes.length === 0 && deletes.length === 0) {
+    if (binary.length) {
+      console.log('nothing to push — remote already matches local (text files)');
+      reportBinary();
+      process.exit(2);
+    }
     console.log('nothing to push — remote already matches local');
     return;
   }
@@ -605,6 +677,10 @@ async function cmdPush(projectId, dir) {
   console.log(`pushed: ${writes.length} write(s), ${deletes.length} delete(s) to ${projectId}`);
   if (writes.length) for (const w of writes) console.log(`  + ${w.path}`);
   if (deletes.length) for (const d of deletes) console.log(`  - ${d}`);
+  if (binary.length) {
+    reportBinary();
+    process.exit(2);
+  }
 }
 
 async function cmdCreate(name) {

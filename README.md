@@ -95,6 +95,17 @@ claude-design create "My New Project"
 
 ## Limitations
 
+- **Text only — binary files do not round-trip.** The endpoint can only mirror
+  UTF-8 text faithfully. `read_file` **refuses to return binary files at all**
+  (it errors: *"…is a binary file (stored base64); read_file only returns text
+  content"*), and there is no blob-download tool. `write_files` also rejects
+  unrecognized binary content types (e.g. `application/octet-stream`). So the CLI
+  treats any non-UTF-8 file as un-mirrorable: `push` **skips** it (and exits
+  non-zero with a list), and `pull` **skips** any binary file already in the
+  project (reporting it, exit 0). Text files around it still sync normally.
+  Round-trip fidelity for text is exact — HTML special chars, literal `&amp;` /
+  `&lt;` / `&gt;` entities, Unicode, and the presence/absence of a trailing
+  newline are all preserved byte-for-byte.
 - **256 KiB cap.** The underlying `read_file` (and inline `write_files`) tool
   caps file bodies at 256 KiB. Larger files are reported and skipped rather than
   silently truncated. (Server-side `copy_files` could move large assets but is
