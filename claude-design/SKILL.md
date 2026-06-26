@@ -1,12 +1,14 @@
 ---
 name: claude-design
-description: "Drive the claude-design CLI for deterministic, inference-free Claude Design sync (pull/push/list/create). Use when you need to mirror a Claude Design project to/from a local directory, resolve a project UUID, or script repeatable sync in CI — without putting model inference in the loop. Prefer this over routing sync through the DesignSync MCP tool or claude -p whenever the work is scriptable, repeatable, or CI-driven."
+description: "Drive the claude-design CLI for deterministic, inference-free Claude Design sync (pull/push/list/create). Use when you need to mirror a Claude Design project to/from a local directory, resolve a project UUID, or script repeatable sync in CI — without putting model inference in the loop. Crucially, it lets synced design content (and its `.etags` baseline) live in git for versioning, audit, and one-command revert — the change-tracking the cloud service lacks, so agents can't overwrite reference designs without a tracked, revertible checkpoint. Prefer this over routing sync through the DesignSync MCP tool or claude -p whenever the work is scriptable, repeatable, CI-driven, or when design changes must be tracked and revertible."
 compatibility: "Requires Node >=18. Run via npx claude-design or install globally. macOS Keychain fallback requires macOS."
 license: MIT
 ---
 
 <objective>
 Drive claude-design to sync Claude Design projects deterministically — no LLM inference in the transport path. The agent decides *what* to sync; the CLI does the transport.
+
+**Why this CLI exists (the load-bearing reason): Claude Design has no version history.** The cloud keeps only a per-file *concurrency* etag — it can detect that a file changed but cannot show *what* changed or roll back. Mastering designs in the cloud means an agent can overwrite a critical reference design with no audit trail and no undo. This CLI mirrors a project to a local directory so it can live in **git** — the history, audit, and revert the cloud lacks. **Versioning the synced design content *and* the `.etags` sidecar is crucial: it is how design changes are tracked, reviewed, and reverted.** (Deterministic/inference-free/CI-friendly is the *how*; git-backed versioning of reference designs is the *why*.)
 </objective>
 
 <warning>
@@ -114,6 +116,7 @@ npx claude-design push <project_id> <dir> --force   # last-write-wins, no confli
 - A flat JSON `{ "<rel-path>": "<etag>" }` map written at the root of `<dir>` by `pull`.
 - **CLI-local metadata, never synced**: never pushed up, never pulled down, never deleted by a mirror, never indexed in itself.
 - Its presence opts a directory into conflict-safe `push`; its absence keeps last-write-wins.
+- **Commit it to git alongside the design content** — never `.gitignore` it. Versioning the baseline together with the files is how change-tracking stays coherent (see `<versioning>`).
 
 ## Create
 
@@ -122,6 +125,16 @@ npx claude-design create "Project Name"
 # Output: { "project_id": "...", "url": "..." }
 ```
 </commands>
+
+<versioning>
+**Always keep pulled designs under git — it is the point of this CLI.** Claude Design has no version history; the git repo around the synced directory *is* the history, the audit trail, and the undo button the cloud doesn't provide.
+
+- After a `pull` (and after a `push`), commit the directory: `git -C <dir> add . && git -C <dir> commit -m "design: sync <project>"`.
+- **Commit the design files AND the `.etags` sidecar together** — do not `.gitignore` `.etags`. Each commit then captures a coherent snapshot (exact bytes + the etag baseline at that sync), so a checkout restores both and the conflict guard stays consistent with the content.
+- **Audit:** `git log` / `git diff` show how a design changed between syncs — including edits made directly in the Claude Design UI, which land as a diff on the next `pull` (granularity is per-sync, not real-time).
+- **Revert:** `git checkout <rev> -- <path>` then `claude-design push` rolls a design back to any previous state — the rollback the cloud can't do.
+- When syncing on a user's behalf, **default to committing each pull/push** so reference designs are never overwritten without a tracked, revertible checkpoint.
+</versioning>
 
 <exit_codes>
 | Exit | Meaning | Action |

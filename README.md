@@ -2,16 +2,34 @@
 
 ## Why this exists
 
-Claude Design sync normally runs *through an LLM agent* (the DesignSync tool, or
-`claude -p`) — putting model inference in the critical path of every pull/push:
-slow, costly, non-deterministic, and killable on long runs. `claude-design`
-exposes the same sync as plain deterministic commands, so **scripts, CI,
-Makefiles, and git hooks can manage syncing with zero inference in the loop.**
-The agent decides *what* to sync; the CLI does the transport.
+**Claude Design has no version history.** The cloud service keeps only a per-file
+*concurrency* etag — enough to notice a file changed, never enough to show *what*
+changed or to roll back. No revisions, no snapshots, no restore. And the built-in
+ways to sync it — the **DesignSync** tool or `claude -p` — run every pull/push
+*through an LLM agent*, putting model inference in the critical path: slow,
+costly, non-deterministic, and killable on long runs.
+
+`claude-design` exists to fix both — and the first reason is the important one:
+
+- **Versioning, audit & revert — keep the source of truth in git.** The CLI
+  mirrors a project down to an ordinary local directory, so you can put that
+  directory under version control. That is the *only* way to get history, diffs,
+  blame, review, and one-command revert for Claude Design content. Master in the
+  cloud instead and an agent can overwrite a critical reference design with **no
+  audit trail and no way back** — the cloud has no undo. **Commit your pulls (the
+  design files *and* the `.etags` sidecar)** and every sync becomes a restorable,
+  reviewable checkpoint. See *Versioning & change-tracking* below.
+- **Zero inference in the loop — deterministic & CI-friendly.** Sync is plain
+  commands speaking the design MCP wire protocol directly — no model — so it's
+  fast, reproducible, and safe to drive from scripts, CI, Makefiles, and git
+  hooks. The agent decides *what* to sync; the CLI does the transport.
+- **Conflict-safe — never silently clobbers concurrent edits.** A `pull` records
+  each file's etag; a `push` guards every write with it, so if the project was
+  edited in the Claude Design UI since you pulled, the push is refused (exit `5`)
+  rather than overwriting that work.
 
 It mirrors a `claude.ai/design` project down to a local directory and pushes
-local changes back up, byte-faithfully, speaking the design MCP wire protocol
-directly — no model in the loop.
+local changes back up, byte-faithfully.
 
 ---
 
@@ -28,6 +46,35 @@ directly — no model in the loop.
 > than corrupt your files, but it will need updating.
 
 ---
+
+## Versioning & change-tracking (the recommended workflow)
+
+The single most valuable habit with this CLI: **keep your pulled designs under
+git.** Claude Design has no version history of its own, so the git repo around
+your synced directory *is* the history — the audit trail and the undo button the
+cloud service doesn't provide.
+
+```bash
+claude-design pull <project_id> ./design/onboarding
+git -C ./design add onboarding && git -C ./design commit -m "design: pull onboarding"
+```
+
+- **Commit the design content *and* the `.etags` sidecar together.** Versioning
+  `.etags` is part of tracking the design, not an afterthought: each commit then
+  captures a coherent snapshot — the exact bytes *and* the etag baseline at that
+  sync — so a checkout restores both and the conflict guard stays consistent with
+  the content. **Do not `.gitignore` `.etags`.**
+- **Audit:** `git log` / `git diff` show how a design changed between syncs —
+  including edits made directly in the Claude Design UI, which land as a diff on
+  your next `pull`. (Granularity is per-sync, not real-time.)
+- **Revert:** `git checkout <rev> -- <path>` then `claude-design push` rolls a
+  design back to any previous state — the rollback the cloud can't do for you.
+- **Review:** treat design changes like code — branch, open a PR, review the diff
+  before pushing to the shared project.
+
+This is the core reason to prefer `claude-design` over the in-agent **DesignSync**
+tool: it puts your reference designs under real version control instead of
+mastering them in a service that can't undo.
 
 ## Install
 
@@ -189,7 +236,10 @@ on disk). It is **CLI-local metadata and is never synced** — `push` never
 uploads it, `pull` never deletes it, and it is never indexed in itself. Its
 presence is what opts a directory into conflict-safe `push`; if it is absent
 (e.g. a hand-built dir that was never pulled), `push` falls back to the original
-last-write-wins behavior. You can commit it or `.gitignore` it as you prefer.
+last-write-wins behavior. **Commit it alongside the design content** (don't
+`.gitignore` it): versioning the sidecar with the files captures the etag
+baseline at each sync, so the history is a coherent, restorable snapshot — see
+*Versioning & change-tracking* above.
 
 ### Create a project
 
