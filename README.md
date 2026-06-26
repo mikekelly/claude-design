@@ -1,5 +1,16 @@
 # claude-design
 
+> **Driving this with an AI agent (Claude Code, etc.)?** Install the companion
+> skill so the agent knows when and how to use the CLI — auth, sync,
+> conflict-safety, and git-backed versioning:
+>
+> ```bash
+> npx skills add mikekelly/claude-design
+> ```
+>
+> The CLI itself needs no install — run it with `npx claude-design …` (or
+> `npm i -g claude-design`). See **Install** below.
+
 ## Why this exists
 
 **Claude Design has no version history.** The cloud service keeps only a per-file
@@ -187,6 +198,12 @@ Mirrors a project into `<dir>` so the directory is an **exact copy** of the
 project: every file is written byte-faithfully at its relative path, and local
 files that no longer exist upstream are deleted.
 
+> **⚠️ Caution — `pull` overwrites local changes.** It is a destructive
+> down-mirror: it overwrites files in `<dir>` and deletes local files that no
+> longer exist upstream. **Commit or stash any local edits first** — uncommitted
+> changes in `<dir>` are lost. Best practice: keep `<dir>` in git and commit each
+> pull (see *Versioning & change-tracking*).
+
 ```bash
 claude-design pull <project_id> ./design/onboarding
 ```
@@ -226,6 +243,29 @@ claude-design push <project_id> ./design/onboarding --force   # last-write-wins
   false conflict) and only the pending delete(s) are retried.
 - `--force` bypasses all conflict checks (omits `if_match`, skips the delete
   guard) for explicit last-write-wins. It still refreshes `.etags`.
+
+### Resolving a push conflict
+
+If `push` exits `5`, the remote changed since your last pull and **nothing was
+written** — your local files are intact. Resolve it with git rather than reaching
+for `--force` (which would discard the upstream edit):
+
+1. **Record local state** — commit your edits before the next step overwrites them:
+   ```bash
+   git -C <dir> add . && git -C <dir> commit -m "wip: local design edits (pre-reconcile)"
+   ```
+2. **Pull the cloud's current version** (a destructive overwrite — hence step 1
+   first; it also refreshes `.etags` to match upstream):
+   ```bash
+   claude-design pull <project_id> <dir>   # commit this too
+   ```
+3. **Reconcile** your changes with the upstream ones using `git` (`diff` / `merge`,
+   or cherry-pick your edits back onto the pulled state).
+4. **Push** the reconciled result — `claude-design push <project_id> <dir>` now
+   succeeds, since `.etags` matches upstream.
+
+Use `--force` only for a deliberate last-write-wins (local overwrites upstream),
+and only after committing the upstream state in git so it stays recoverable.
 
 ### The `.etags` base-index sidecar
 

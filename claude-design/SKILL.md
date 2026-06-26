@@ -89,6 +89,7 @@ Resolve a project name → UUID from `list`. Only ask the user to paste a design
 npx claude-design pull <project_id> <dir>
 ```
 
+- ⚠️ **Destructive — `pull` OVERWRITES local files and deletes local files not upstream.** Treat with care: commit (or stash) any local edits in `<dir>` first, or they are lost. Pair every pull with a git commit (see `<versioning>`).
 - Exact down-mirror: writes every remote file byte-faithfully, deletes local files no longer upstream
 - Skips tool-managed artifacts (`.thumbnail`, `.design-canvas.state.json`)
 - Never deletes local `PROVENANCE.md` or `CANONICAL.md` sidecars
@@ -135,6 +136,19 @@ npx claude-design create "Project Name"
 - **Revert:** `git checkout <rev> -- <path>` then `claude-design push` rolls a design back to any previous state — the rollback the cloud can't do.
 - When syncing on a user's behalf, **default to committing each pull/push** so reference designs are never overwritten without a tracked, revertible checkpoint.
 </versioning>
+
+<conflict_resolution>
+When `push` exits **5** (conflict — the project changed in the Claude Design UI since your last pull), **nothing was written and your local files are intact.** Do NOT reflexively `--force` (that discards the upstream edit). Resolve through git:
+
+1. **Record local state first.** Commit your local edits before the next step overwrites the working tree:
+   `git -C <dir> add . && git -C <dir> commit -m "wip: local design edits (pre-reconcile)"`
+2. **Pull the cloud's current version.** This is a destructive overwrite — which is exactly why step 1 came first — and it rewrites `.etags` to match upstream:
+   `claude-design pull <project_id> <dir>` (commit this too, so the upstream state is captured as a commit)
+3. **Reconcile.** Use `git diff` / `git merge` (or cherry-pick your edits back on top of the pulled state) to combine your changes with the upstream ones, preserving both intents.
+4. **Push the reconciled result.** `claude-design push <project_id> <dir>` — the refreshed `.etags` now matches upstream, so the guarded push succeeds.
+
+`--force` is only for a deliberate last-write-wins (your local state overwrites upstream, the upstream edit is lost) — and only after you've committed the upstream state in git so it remains recoverable.
+</conflict_resolution>
 
 <exit_codes>
 | Exit | Meaning | Action |
