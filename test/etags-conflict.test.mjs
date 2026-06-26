@@ -172,6 +172,19 @@ function startMcpStub(initialStore = {}, opts = {}) {
         }
 
         if (name === 'delete_files') {
+          // opts.onDeleteFiles(paths, store) optional hook: return a JSON-RPC
+          // error object to simulate a transport/server failure on delete (used
+          // to model a partial push where write_files landed but delete_files
+          // dies). Returning anything else / undefined falls through to the
+          // default success behavior.
+          if (opts.onDeleteFiles) {
+            const custom = opts.onDeleteFiles(args.paths || [], store);
+            if (custom && custom.error) {
+              res.writeHead(200, headers);
+              res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, error: custom.error }));
+              return;
+            }
+          }
           for (const p of args.paths || []) store.delete(p);
           ok(textResult({ deleted: args.paths || [] }));
           return;
@@ -508,6 +521,133 @@ test('without a .etags present, push sends no if_match (backwards-compat)', asyn
       );
       // And push must NOT create a .etags out of thin air.
       assert.ok(!existsSync(join(dir, ETAGS_FILE)), 'push must not birth a .etags');
+    } finally {
+      stub.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 9: PARTIAL APPLICATION. write_files succeeds but delete_files then
+// fails (transport/server error). The push must:
+//   (a) exit non-zero with a partial-application message naming writes-ok /
+//       deletes-failed and telling the user to re-run;
+//   (b) refresh .etags with the WRITTEN files' new etags despite the delete
+//       failure (so the landed writes are recorded);
+//   (c) on a re-run (delete now succeeds) complete the pending delete, exit 0;
+//   (d) after the partial failure, editing a written file and pushing must NOT
+//       produce a false conflict — the refreshed etag is used as if_match.
+// ---------------------------------------------------------------------------
+test('partial push (write ok, delete fails) refreshes .etags for writes and re-run converges', async () => {
+  await withHome(async (home) => {
+    let failDeletes = true; // flipped to false to model the recovery re-run
+    const stub = await startMcpStub(
+      {
+        'keep.txt': { content: 'keep' },
+        'gone.txt': { content: 'doomed' },
+      },
+      {
+        onDeleteFiles: () =>
+          failDeletes ? { error: { code: -32000, message: 'simulated transport failure' } } : null,
+      },
+    );
+    const dir = makeDir();
+    try {
+      await seedAuth(home);
+      assert.equal((await run(['pull', 'p1', dir], { home, mcpUrl: stub.url })).code, 0);
+      const baseKeepEtag = readEtags(dir)['keep.txt'];
+
+      // Edit keep.txt (a write) AND delete gone.txt locally → push does both.
+      writeFileSync(join(dir, 'keep.txt'), 'keep-edited');
+      rmSync(join(dir, 'gone.txt'));
+
+      const push = await run(['push', 'p1', dir], { home, mcpUrl: stub.url });
+      // (a) non-zero exit + a clear partial-application message.
+      assert.notEqual(push.code, 0, `partial push must exit non-zero: ${push.stdout}`);
+      assert.equal(push.code, 1, `partial push uses EXIT.error (1): ${push.stderr}`);
+      assert.match(push.stderr, /partially applied/i, push.stderr);
+      assert.match(push.stderr, /write/i, push.stderr);
+      assert.match(push.stderr, /delete/i, push.stderr);
+      assert.match(push.stderr, /re-run/i, push.stderr);
+
+      // The write actually landed remotely (writes-first ordering).
+      assert.equal(stub.store.get('keep.txt').content, 'keep-edited');
+      // The delete did NOT happen — gone.txt still present remotely.
+      assert.ok(stub.store.has('gone.txt'), 'failed delete must leave the remote file');
+
+      // (b) .etags refreshed with the written file's NEW etag despite the failure.
+      const remoteKeepEtag = stub.store.get('keep.txt').etag;
+      assert.notEqual(remoteKeepEtag, baseKeepEtag, 'remote etag advanced on write');
+      assert.equal(
+        readEtags(dir)['keep.txt'],
+        remoteKeepEtag,
+        '.etags must carry the written etag even though delete_files failed',
+      );
+      // gone.txt is still in .etags (the delete never completed).
+      assert.ok('gone.txt' in readEtags(dir), 'pending delete stays in .etags');
+
+      // (c) Re-run with deletes now succeeding → completes the delete, exit 0.
+      // Snapshot the write-call count: a converged push must issue NO write_files
+      // (keep.txt is now local==remote), so the count must not grow on the re-run.
+      const writeCallsBeforeRerun = stub.writeCalls.length;
+      failDeletes = false;
+      const push2 = await run(['push', 'p1', dir], { home, mcpUrl: stub.url });
+      assert.equal(push2.code, 0, `re-run must converge: ${push2.stderr}`);
+      assert.ok(!stub.store.has('gone.txt'), 're-run completes the pending delete');
+      assert.ok(!('gone.txt' in readEtags(dir)), 'deleted path dropped from .etags');
+      assert.equal(
+        stub.writeCalls.length,
+        writeCallsBeforeRerun,
+        're-run must not re-write the converged file (no new write_files call)',
+      );
+    } finally {
+      stub.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 9b: after a partial push, editing a written file and pushing again
+// must NOT raise a false conflict — the refreshed etag is the if_match.
+// ---------------------------------------------------------------------------
+test('after a partial push, re-editing a written file pushes without a false conflict', async () => {
+  await withHome(async (home) => {
+    let failDeletes = true;
+    const stub = await startMcpStub(
+      {
+        'keep.txt': { content: 'keep' },
+        'gone.txt': { content: 'doomed' },
+      },
+      {
+        onDeleteFiles: () =>
+          failDeletes ? { error: { code: -32000, message: 'simulated transport failure' } } : null,
+      },
+    );
+    const dir = makeDir();
+    try {
+      await seedAuth(home);
+      assert.equal((await run(['pull', 'p1', dir], { home, mcpUrl: stub.url })).code, 0);
+
+      writeFileSync(join(dir, 'keep.txt'), 'keep-edited');
+      rmSync(join(dir, 'gone.txt'));
+      const push = await run(['push', 'p1', dir], { home, mcpUrl: stub.url });
+      assert.notEqual(push.code, 0, push.stderr);
+
+      const refreshedEtag = readEtags(dir)['keep.txt'];
+
+      // Now edit the already-written file again. Deletes still fail, but the
+      // write must carry the refreshed if_match (no stale base → no false conflict).
+      writeFileSync(join(dir, 'keep.txt'), 'keep-edited-again');
+      const push2 = await run(['push', 'p1', dir], { home, mcpUrl: stub.url });
+      // Still partial (delete fails) but the WRITE half must have succeeded with
+      // no conflict — the message is partial-application, not conflict (exit 1 not 5).
+      assert.equal(push2.code, 1, `must be partial (1), not a false conflict (5): ${push2.stderr}`);
+      assert.doesNotMatch(push2.stderr, /CONFLICT/i, push2.stderr);
+      const sent = stub.writeCalls.at(-1).find((f) => f.path === 'keep.txt');
+      assert.equal(sent.if_match, refreshedEtag, 'if_match must be the refreshed etag, not the stale base');
+      assert.equal(stub.store.get('keep.txt').content, 'keep-edited-again', 'second write landed');
     } finally {
       stub.close();
       rmSync(dir, { recursive: true, force: true });

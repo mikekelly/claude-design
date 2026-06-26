@@ -1116,17 +1116,45 @@ async function cmdPush(projectId, dir, { force = false } = {}) {
       writtenEtags = wdata.etags;
     }
   }
-  if (deletes.length) {
-    await session.call('delete_files', {
-      project_id: projectId,
-      plan_token: planToken,
-      paths: deletes,
-    });
+
+  // Two-phase mutation, two-phase .etags refresh. The push applies write_files
+  // then delete_files under one plan_token, and writes-first is the safe order
+  // (a delete failure cannot lose data the writes already landed). The matching
+  // hazard is the INDEX: if delete_files dies after the writes landed but before
+  // we record their new etags, a future edit+push of a written file would send a
+  // STALE base if_match → a spurious conflict. So persist the written files'
+  // fresh etags NOW (before delete_files), then persist again after the deletes
+  // complete to drop the deleted paths. Net: the writes' etags survive a partial
+  // failure and a re-run converges. Only when baseEtags != null — push never
+  // CREATES .etags; it's born on pull.
+  if (baseEtags != null && writes.length) {
+    writeEtagsIndex(dir, { ...baseEtags, ...writtenEtags });
   }
 
-  // Refresh the base index on success (only when it already exists — push never
-  // CREATES one; .etags is born on pull). Merge in the new etags for written
-  // files and drop deleted paths so the next push carries fresh if_match values.
+  if (deletes.length) {
+    // delete_files is the second mutation. A transport/server failure here is a
+    // PARTIAL application, not a total failure: the writes already landed and
+    // (above) their etags are recorded. Surface that precisely instead of the
+    // bare network/server error fail() would emit — a re-run completes the
+    // remaining deletes (the converged writes drop out of the recomputed set).
+    // allowError keeps this narrow: only this one call is softened.
+    const del = await session.call(
+      'delete_files',
+      { project_id: projectId, plan_token: planToken, paths: deletes },
+      { allowError: true },
+    );
+    if (del && del.isError) {
+      console.error(
+        `\npush partially applied: ${writes.length} write(s) succeeded; ` +
+          `delete(s) failed (${del.message}) — re-run \`claude-design push\` to ` +
+          'complete the remaining delete(s).',
+      );
+      process.exit(EXIT.error);
+    }
+  }
+
+  // Both phases applied. Refresh the index again, now dropping the deleted paths
+  // so the next push carries fresh if_match values and no longer references them.
   if (baseEtags != null) {
     const next = { ...baseEtags, ...writtenEtags };
     for (const d of deletes) delete next[d];

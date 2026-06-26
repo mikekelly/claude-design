@@ -121,6 +121,7 @@ the token value.
 | `whoami` — not authenticated / expired                | `4`  | run `claude-design login`                |
 | any sync command — no valid token available           | `4`  | not authenticated — run `... login`      |
 | `push` — remote changed since your last pull (conflict)| `5`  | re-pull and reapply, or push `--force`   |
+| `push` — writes landed but a delete failed (partial)  | `1`  | re-run `push` to finish the delete(s)    |
 | any command — bad usage                               | `2`  | usage error                              |
 | any command — generic failure / contract drift        | `1` / `3` | failure (see message)               |
 
@@ -170,6 +171,12 @@ claude-design push <project_id> ./design/onboarding --force   # last-write-wins
   paths are named, and the CLI exits `5`. Re-pull and reapply, or pass `--force`.
 - After a successful push the `.etags` index is **refreshed** from the etags the
   server returns, so consecutive pushes (without an intervening pull) work.
+- Push applies writes **then** deletes (writes-first: a delete failure can never
+  lose written data). The `.etags` index is refreshed for the written files
+  immediately after the writes land — *before* the deletes — so if a delete then
+  fails, the push reports a **partial application** (exit `1`) and a re-run
+  converges: the landed writes are already recorded (no stale `if_match`, no
+  false conflict) and only the pending delete(s) are retried.
 - `--force` bypasses all conflict checks (omits `if_match`, skips the delete
   guard) for explicit last-write-wins. It still refreshes `.etags`.
 
