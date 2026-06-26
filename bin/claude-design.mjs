@@ -1079,39 +1079,60 @@ async function cmdPush(projectId, dir, { force = false } = {}) {
   // itself advances the remote, so the next push's if_match must reflect that.
   let writtenEtags = {};
   if (writes.length) {
-    const result = await session.call('write_files', {
-      project_id: projectId,
-      plan_token: planToken,
-      // if_match is sourced from the .etags BASE (pull/last-push time), never a
-      // push-time read_file — only the base value guards the real remote-vs-local
-      // window. The "0" sentinel means "expected absent" → create-only.
-      files: writes.map((w) => ({
-        path: w.path,
-        data: w.data,
-        encoding: 'base64',
-        ...(guard ? { if_match: baseEtags[w.path] ?? '0' } : {}),
-      })),
-    });
-    // Parse defensively: a conflict OR an etags map is JSON, but a bare
-    // success confirmation might not be — and previously this result was
-    // ignored entirely, so a non-JSON success must NOT become contract drift.
-    const wdata = tryResultJson(result);
-    if (wdata && wdata.status === 'conflict') {
-      // write_files is atomic: on conflict NOTHING was written. Abort the whole
-      // push (don't proceed to deletes) and report the drifted paths.
-      const conflicts = Array.isArray(wdata.conflicts) ? wdata.conflicts : [];
-      const paths = conflicts.map((c) => (c && c.path) || c).filter(Boolean);
-      console.error(
-        '\nCONFLICT: the following file(s) changed upstream since your last pull — ' +
-          'nothing was written (push is atomic):',
-      );
-      for (const p of (paths.length ? paths : ['(unspecified)'])) console.error(`  ${p}`);
-      console.error(
-        '\nRemote changed since your last pull — re-pull and reapply, or use --force ' +
-          'to overwrite (last-write-wins).',
-      );
-      process.exit(EXIT.conflict);
+    // allowError:true is REQUIRED: the LIVE endpoint returns an if_match
+    // mismatch as a tool result with isError:true (the conflict JSON in its text
+    // block). Without allowError, Session.call would hard-fail (generic exit 1)
+    // and skip the conflict path below. write_files is atomic so nothing is
+    // written either way, but the exit code/message must be the conflict ones.
+    const result = await session.call(
+      'write_files',
+      {
+        project_id: projectId,
+        plan_token: planToken,
+        // if_match is sourced from the .etags BASE (pull/last-push time), never a
+        // push-time read_file — only the base value guards the real remote-vs-local
+        // window. The "0" sentinel means "expected absent" → create-only.
+        files: writes.map((w) => ({
+          path: w.path,
+          data: w.data,
+          encoding: 'base64',
+          ...(guard ? { if_match: baseEtags[w.path] ?? '0' } : {}),
+        })),
+      },
+      { allowError: true },
+    );
+    if (result.isError) {
+      // The error body is the tool's text block. A conflict is the expected,
+      // recoverable error → run the conflict path. Anything else is a genuine
+      // failure → fail loudly (today's behavior for real write_files errors).
+      let parsed = null;
+      try {
+        parsed = JSON.parse(result.message);
+      } catch {
+        /* non-JSON error → treated as a genuine failure below */
+      }
+      if (parsed && parsed.status === 'conflict') {
+        // write_files is atomic: on conflict NOTHING was written. Abort the whole
+        // push (don't proceed to deletes) and report the drifted paths.
+        const conflicts = Array.isArray(parsed.conflicts) ? parsed.conflicts : [];
+        const paths = conflicts.map((c) => (c && c.path) || c).filter(Boolean);
+        console.error(
+          '\nCONFLICT: the following file(s) changed upstream since your last pull — ' +
+            'nothing was written (push is atomic):',
+        );
+        for (const p of (paths.length ? paths : ['(unspecified)'])) console.error(`  ${p}`);
+        console.error(
+          '\nRemote changed since your last pull — re-pull and reapply, or use --force ' +
+            'to overwrite (last-write-wins).',
+        );
+        process.exit(EXIT.conflict);
+      }
+      fail(`write_files failed: ${result.message}`);
     }
+    // Success: parse defensively — an etags map is JSON, but a bare success
+    // confirmation might not be, so a non-JSON success must NOT become contract
+    // drift (this result was previously ignored entirely).
+    const wdata = tryResultJson(result);
     if (wdata && wdata.etags && typeof wdata.etags === 'object') {
       writtenEtags = wdata.etags;
     }

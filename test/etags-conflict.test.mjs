@@ -6,9 +6,11 @@
 // finalize_plan, write_files (honoring per-file if_match + emitting a
 // status:"conflict" result on mismatch), and delete_files.
 //
-// The conflict-response shape ({ status:"conflict", conflicts:[{path, etag,
-// content_omitted}] }) is modeled here from the task spec / live tool
-// description; it is NOT verified against the live endpoint (see README note).
+// The conflict-response shape is modeled to match the LIVE endpoint: write_files
+// answers an if_match mismatch with a tool result carrying isError:true whose
+// single text block is the conflict JSON — { status:"conflict",
+// conflicts:[{path, etag, current_content|content_omitted}], message }. The CLI
+// must read this via { allowError:true } and branch on status==="conflict".
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -151,12 +153,41 @@ function startMcpStub(initialStore = {}, opts = {}) {
             const cur = store.get(f.path);
             const curEtag = cur ? cur.etag : '0';
             if (f.if_match !== undefined && f.if_match !== curEtag) {
-              conflicts.push({ path: f.path, etag: curEtag, content_omitted: true });
+              // Mirror the LIVE endpoint: small files carry current_content
+              // (the entity-wrapped current bytes); larger/absent ones would
+              // instead carry content_omitted. The CLI only needs the path.
+              const conflict = { path: f.path, etag: curEtag };
+              if (cur) {
+                conflict.current_content =
+                  `<untrusted-project-content path="${f.path}" etag="${curEtag}">\n` +
+                  `${escapeEntities(cur.content)}\n</untrusted-project-content>`;
+              } else {
+                conflict.content_omitted = true;
+              }
+              conflicts.push(conflict);
             }
           }
           if (conflicts.length) {
-            // Atomic: nothing written.
-            ok(textResult({ status: 'conflict', conflicts }));
+            // Atomic: nothing written. The LIVE endpoint returns the conflict as
+            // a tool result with isError:true whose single text block is the
+            // conflict JSON (status/conflicts/message). The CLI must consume this
+            // via { allowError:true }, NOT treat it as a hard tool failure.
+            ok({
+              isError: true,
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    conflicts,
+                    message:
+                      'write_files: refused — the user (or another writer) changed one or more ' +
+                      'of these files since your if_match etag. Nothing was written. Re-base on ' +
+                      'current_content and retry.',
+                    status: 'conflict',
+                  }),
+                },
+              ],
+            });
             return;
           }
           // Apply writes, bump etags.
