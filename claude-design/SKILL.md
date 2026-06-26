@@ -92,17 +92,28 @@ npx claude-design pull <project_id> <dir>
 - Never deletes local `PROVENANCE.md` or `CANONICAL.md` sidecars
 - Binary files: **skipped and reported** (endpoint only returns text via `read_file`); exit 0 still
 - Files ≥ 256 KiB: **not written**, reported loudly → exit **2**
+- Writes a `.etags` base-index sidecar recording each file's etag → enables conflict-safe push
 
 ## Push (UP mirror)
 
 ```bash
 npx claude-design push <project_id> <dir>
+npx claude-design push <project_id> <dir> --force   # last-write-wins, no conflict checks
 ```
 
 - Uploads added/changed text files; deletes remote files removed locally
 - Never deletes tool-managed artifacts upstream
 - Non-UTF-8 (binary) files: **skipped and reported** → exit **2** if any skipped
 - Files ≥ 256 KiB: **fails loudly before writing anything** → exit **2**
+- **Conflict-safe when a `.etags` is present** (dir came from a `pull`): each write is guarded by a per-file `if_match` (the pull-time etag; new files use a `"0"` create-only sentinel), and delete targets are checked for upstream drift. If the remote changed since your last pull, the push is **refused atomically** (nothing written), conflicting paths are named, and it exits **5** — re-pull and reapply, or pass `--force`.
+- `.etags` is **refreshed** from the server's returned etags after a successful push, so consecutive pushes (no intervening pull) work.
+- No `.etags` present → falls back to the original last-write-wins behavior (no `if_match` sent).
+
+## The `.etags` sidecar
+
+- A flat JSON `{ "<rel-path>": "<etag>" }` map written at the root of `<dir>` by `pull`.
+- **CLI-local metadata, never synced**: never pushed up, never pulled down, never deleted by a mirror, never indexed in itself.
+- Its presence opts a directory into conflict-safe `push`; its absence keeps last-write-wins.
 
 ## Create
 
@@ -118,6 +129,7 @@ npx claude-design create "Project Name"
 | `0` | Success | — |
 | `2` | Usage error or oversized/binary files flagged | Fix args or check file size |
 | `4` | Not authenticated | Run the login flow |
+| `5` | `push` conflict: remote changed since your last pull | Re-pull and reapply, or `push --force` |
 | `20` | Auth failed / timed out / port unavailable | Re-run `claude-design login` and repeat |
 | `1`/`3` | Generic failure / contract drift | Read the message; CLI may need updating |
 </exit_codes>

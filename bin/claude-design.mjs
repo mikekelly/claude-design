@@ -59,14 +59,22 @@ const EXIT = {
   error: 1, // generic failure
   usage: 2, // bad usage (matches existing push/pull cap-fail convention)
   notAuthenticated: 4, // a command needs auth but no valid token is available
+  conflict: 5, // push: remote changed since last pull (etag/if_match mismatch)
   authFailed: 20, // monitor-auth: failed / timed out / bad state
 };
+
+// CLI-local base-index sidecar: a flat { "<rel-posix-path>": "<etag>" } map of
+// the etags observed at the last pull/push, used as per-file if_match on push to
+// detect-and-refuse-on-conflict. It is metadata, NEVER synced in either
+// direction (never pushed up, never pulled down, never deleted by a mirror).
+const ETAGS_FILE = '.etags';
 
 // Files that are tool-managed artifacts on the design side: never mirror down,
 // never delete up.
 const SKIP_SUFFIXES = ['.thumbnail', '.design-canvas.state.json'];
-// Local-only sidecars we must never delete during a DOWN mirror.
-const PROTECTED_BASENAMES = ['PROVENANCE.md', 'CANONICAL.md'];
+// Local-only sidecars we must never delete during a DOWN mirror. The .etags
+// base-index is CLI-local metadata and gets the same protection.
+const PROTECTED_BASENAMES = ['PROVENANCE.md', 'CANONICAL.md', ETAGS_FILE];
 
 function fail(msg, code = 1) {
   console.error(`claude-design: ${msg}`);
@@ -561,6 +569,23 @@ function resultJson(result, toolName) {
   }
 }
 
+// Like resultJson but non-fatal: returns the parsed object, or null when the
+// result carries no JSON payload (used for tool results whose body is optional,
+// e.g. write_files, which may answer with a plain confirmation OR a structured
+// { status:"conflict", … } / { etags } object).
+function tryResultJson(result) {
+  if (result && result.structuredContent && typeof result.structuredContent === 'object') {
+    return result.structuredContent;
+  }
+  const txt = extractText(result);
+  if (!txt) return null;
+  try {
+    return JSON.parse(txt);
+  } catch {
+    return null;
+  }
+}
+
 // Decode a read_file result into raw bytes (Buffer).
 // read_file wraps content; text is HTML-entity-escaped, blobs are base64.
 function decodeReadFile(result, path) {
@@ -624,12 +649,67 @@ function unescapeEntities(s) {
     .replace(/&amp;/g, '&');
 }
 
+// Extract the `etag="…"` attribute from a read_file wrapper's opening tag. The
+// etag is captured here (not from list_files) so it matches the bytes we
+// actually persist — the read_file response carries content+etag atomically,
+// while a list_files etag could go stale between listing and reading. Returns
+// the etag string, or null when the response carries no etag (contract drift on
+// that one file → caller omits it from .etags and falls back to last-write-wins).
+function extractEtag(result) {
+  // Prefer a blob resource's etag if the server ever surfaces one structurally.
+  const blocks = (result && result.content) || [];
+  const txt = blocks
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('');
+  const m = txt.match(/^<untrusted-project-content(?=\s)[^>]*\setag="([^"]*)"/);
+  return m ? m[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// .etags base-index sidecar (CLI-local metadata; never synced)
+// ---------------------------------------------------------------------------
+function etagsPath(dir) {
+  return join(dir, ETAGS_FILE);
+}
+
+// Read the base index, or null when absent (absent => opt-out: push falls back
+// to last-write-wins, the backwards-compatible default).
+function readEtagsIndex(dir) {
+  const p = etagsPath(dir);
+  if (!existsSync(p)) return null;
+  try {
+    const obj = JSON.parse(readFileSync(p, 'utf8'));
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeEtagsIndex(dir, map) {
+  // Deterministic key order so the sidecar diffs cleanly across runs.
+  const sorted = {};
+  for (const k of Object.keys(map).sort()) sorted[k] = map[k];
+  writeFileSync(etagsPath(dir), `${JSON.stringify(sorted, null, 2)}\n`);
+}
+
 // ---------------------------------------------------------------------------
 // File listing — recursive descent over list_files
 // ---------------------------------------------------------------------------
 // Returns an array of file path strings (project-relative, posix-style).
 async function listAllFiles(session, projectId) {
+  const { files } = await listAllFilesWithEtags(session, projectId);
+  return files;
+}
+
+// As listAllFiles, but also returns { etagByPath } harvested from the listing
+// entries (when the server surfaces a per-entry etag). Used by push's
+// delete-drift guard: delete_files has no if_match, so the only way to refuse a
+// delete of a file edited upstream since pull is to compare the listing's
+// current etag against the .etags base value.
+async function listAllFilesWithEtags(session, projectId) {
   const files = [];
+  const etagByPath = {};
   async function descend(dir) {
     const result = await session.call('list_files', { project_id: projectId, path: dir });
     const entries = parseListing(result, dir);
@@ -638,11 +718,12 @@ async function listAllFiles(session, projectId) {
         await descend(entry.path);
       } else {
         files.push(entry.path);
+        if (entry.etag != null) etagByPath[entry.path] = entry.etag;
       }
     }
   }
   await descend('');
-  return files;
+  return { files, etagByPath };
 }
 
 // Normalize a list_files result into [{path, isDir}].
@@ -662,7 +743,7 @@ function parseListing(result, dir) {
     if (typeof e === 'string') {
       // Bare string path; infer dir by trailing slash.
       const isDir = e.endsWith('/');
-      return { path: joinPosix(dir, stripSlash(e)), isDir };
+      return { path: joinPosix(dir, stripSlash(e)), isDir, etag: null };
     }
     const name = e.path || e.name;
     if (typeof name !== 'string') {
@@ -681,7 +762,8 @@ function parseListing(result, dir) {
     const full = name.includes('/') && (dir === '' || name.startsWith(dir))
       ? stripSlash(name)
       : joinPosix(dir, stripSlash(name));
-    return { path: full, isDir };
+    const etag = typeof e.etag === 'string' ? e.etag : null;
+    return { path: full, isDir, etag };
   });
 }
 
@@ -694,6 +776,9 @@ function joinPosix(dir, name) {
 }
 
 function shouldSkip(path) {
+  // The .etags base-index is CLI-local metadata — never mirror it in either
+  // direction (mirrored alongside the suffix-based tool artifacts).
+  if (path === ETAGS_FILE) return true;
   return SKIP_SUFFIXES.some((s) => path.endsWith(s));
 }
 
@@ -774,6 +859,10 @@ async function cmdPull(projectId, dir) {
   const remotePaths = (await listAllFiles(session, projectId)).filter((p) => !shouldSkip(p));
   const oversize = [];
   const binary = [];
+  // Base index built from the read_file responses (etag sourced atomically with
+  // the bytes we write — see extractEtag). Only files actually written get an
+  // entry; binary/oversize/etag-less files are correctly omitted.
+  const etagIndex = {};
   let pulled = 0;
 
   for (const path of remotePaths) {
@@ -804,6 +893,10 @@ async function cmdPull(projectId, dir) {
     const dest = join(dir, ...path.split('/'));
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, bytes);
+    // Record this file's etag (sourced from THIS read_file response) so a later
+    // push can guard it with if_match. Omit on contract drift (no etag present).
+    const etag = extractEtag(result);
+    if (etag != null) etagIndex[path] = etag;
     pulled++;
   }
 
@@ -820,6 +913,10 @@ async function cmdPull(projectId, dir) {
     deleted++;
   }
   pruneEmptyDirs(dir);
+
+  // Persist the base index AFTER writes+deletes settle. Its presence is what
+  // opts a directory into conflict-safe push; absence keeps last-write-wins.
+  writeEtagsIndex(dir, etagIndex);
 
   console.log(`pulled ${pulled} file(s) into ${dir}`);
   if (deleted) console.log(`deleted ${deleted} local file(s) no longer upstream`);
@@ -858,13 +955,20 @@ function pruneEmptyDirs(root) {
   })(root);
 }
 
-async function cmdPush(projectId, dir) {
-  if (!projectId || !dir) fail('usage: claude-design push <project_id> <dir>');
+async function cmdPush(projectId, dir, { force = false } = {}) {
+  if (!projectId || !dir) fail('usage: claude-design push <project_id> <dir> [--force]');
   if (!existsSync(dir)) fail(`local dir does not exist: ${dir}`);
   const session = await Session.open();
   await session.verifyTools(['list_files', 'read_file', 'finalize_plan', 'write_files', 'delete_files']);
 
-  const remotePaths = (await listAllFiles(session, projectId)).filter((p) => !shouldSkip(p));
+  // The base index opts a directory into conflict-safe push. Absent (or --force)
+  // => last-write-wins, the backwards-compatible default (no if_match sent, no
+  // delete-drift guard). guard === true means: enforce conflict detection.
+  const baseEtags = readEtagsIndex(dir);
+  const guard = !force && baseEtags != null;
+
+  const { files: allRemote, etagByPath: remoteEtags } = await listAllFilesWithEtags(session, projectId);
+  const remotePaths = allRemote.filter((p) => !shouldSkip(p));
   const remoteSet = new Set(remotePaths);
 
   const localPaths = walkLocal(dir).filter((p) => !shouldSkip(p) && !isProtectedLocal(p));
@@ -912,6 +1016,32 @@ async function cmdPush(projectId, dir) {
   // tool files (already excluded from remotePaths).
   const deletes = remotePaths.filter((p) => !localSet.has(p));
 
+  // Delete-drift guard (only when guarding): delete_files has no if_match and
+  // finalize_plan.base_etags is writes-only, so the server cannot refuse a stale
+  // delete. Compare each delete target's CURRENT remote etag (from the listing)
+  // against the .etags base value; a difference means the file was edited
+  // upstream since our pull, so deleting it would silently destroy that edit.
+  if (guard) {
+    const driftedDeletes = deletes.filter((p) => {
+      const base = baseEtags[p];
+      const current = remoteEtags[p];
+      // Only enforce when we have both a base and a current etag to compare.
+      // (A missing base means we never recorded it — fall back to allowing.)
+      return base != null && current != null && base !== current;
+    });
+    if (driftedDeletes.length) {
+      console.error(
+        '\nCONFLICT: the following file(s) changed upstream since your last pull and ' +
+          'were about to be DELETED (refusing — your delete would discard a remote edit):',
+      );
+      for (const p of driftedDeletes) console.error(`  ${p}`);
+      console.error(
+        '\nRe-pull and reapply, or use --force to overwrite (last-write-wins).',
+      );
+      process.exit(EXIT.conflict);
+    }
+  }
+
   const reportBinary = () => {
     if (!binary.length) return;
     console.error(
@@ -943,12 +1073,48 @@ async function cmdPush(projectId, dir) {
     contractDrift(`finalize_plan returned no plan_token (keys: ${Object.keys(planData)})`);
   }
 
+  // writtenEtags collects the NEW etag of every written file (returned by
+  // write_files). Refreshing .etags from these — not just from pull — is what
+  // lets two consecutive pushes (no intervening pull) both succeed: the CLI
+  // itself advances the remote, so the next push's if_match must reflect that.
+  let writtenEtags = {};
   if (writes.length) {
-    await session.call('write_files', {
+    const result = await session.call('write_files', {
       project_id: projectId,
       plan_token: planToken,
-      files: writes.map((w) => ({ path: w.path, data: w.data, encoding: 'base64' })),
+      // if_match is sourced from the .etags BASE (pull/last-push time), never a
+      // push-time read_file — only the base value guards the real remote-vs-local
+      // window. The "0" sentinel means "expected absent" → create-only.
+      files: writes.map((w) => ({
+        path: w.path,
+        data: w.data,
+        encoding: 'base64',
+        ...(guard ? { if_match: baseEtags[w.path] ?? '0' } : {}),
+      })),
     });
+    // Parse defensively: a conflict OR an etags map is JSON, but a bare
+    // success confirmation might not be — and previously this result was
+    // ignored entirely, so a non-JSON success must NOT become contract drift.
+    const wdata = tryResultJson(result);
+    if (wdata && wdata.status === 'conflict') {
+      // write_files is atomic: on conflict NOTHING was written. Abort the whole
+      // push (don't proceed to deletes) and report the drifted paths.
+      const conflicts = Array.isArray(wdata.conflicts) ? wdata.conflicts : [];
+      const paths = conflicts.map((c) => (c && c.path) || c).filter(Boolean);
+      console.error(
+        '\nCONFLICT: the following file(s) changed upstream since your last pull — ' +
+          'nothing was written (push is atomic):',
+      );
+      for (const p of (paths.length ? paths : ['(unspecified)'])) console.error(`  ${p}`);
+      console.error(
+        '\nRemote changed since your last pull — re-pull and reapply, or use --force ' +
+          'to overwrite (last-write-wins).',
+      );
+      process.exit(EXIT.conflict);
+    }
+    if (wdata && wdata.etags && typeof wdata.etags === 'object') {
+      writtenEtags = wdata.etags;
+    }
   }
   if (deletes.length) {
     await session.call('delete_files', {
@@ -956,6 +1122,15 @@ async function cmdPush(projectId, dir) {
       plan_token: planToken,
       paths: deletes,
     });
+  }
+
+  // Refresh the base index on success (only when it already exists — push never
+  // CREATES one; .etags is born on pull). Merge in the new etags for written
+  // files and drop deleted paths so the next push carries fresh if_match values.
+  if (baseEtags != null) {
+    const next = { ...baseEtags, ...writtenEtags };
+    for (const d of deletes) delete next[d];
+    writeEtagsIndex(dir, next);
   }
 
   console.log(`pushed: ${writes.length} write(s), ${deletes.length} delete(s) to ${projectId}`);
@@ -1287,7 +1462,8 @@ Usage:
   claude-design logout                        Clear the CLI's stored token + pending login
   claude-design list                          List your design projects (id + name)
   claude-design pull <project_id> <dir>       Mirror a project DOWN into <dir>
-  claude-design push <project_id> <dir>       Mirror <dir> UP to a project
+  claude-design push <project_id> <dir> [--force]
+                                              Mirror <dir> UP (conflict-safe when a .etags is present; --force = last-write-wins)
   claude-design create <name>                 Create a new project
   claude-design serve <dir> [--port <n>] [--open] [--no-reload]
                                               Serve <dir> over HTTP with live-reload (default port 4321)
@@ -1323,9 +1499,11 @@ async function main() {
     case 'pull':
       await cmdPull(args[0], args[1]);
       break;
-    case 'push':
-      await cmdPush(args[0], args[1]);
+    case 'push': {
+      const positional = args.filter((a) => !a.startsWith('--'));
+      await cmdPush(positional[0], positional[1], { force: args.includes('--force') });
       break;
+    }
     case 'create':
       await cmdCreate(args[0]);
       break;

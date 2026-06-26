@@ -120,6 +120,7 @@ the token value.
 | `whoami` — authenticated                              | `0`  | a usable token is available              |
 | `whoami` — not authenticated / expired                | `4`  | run `claude-design login`                |
 | any sync command — no valid token available           | `4`  | not authenticated — run `... login`      |
+| `push` — remote changed since your last pull (conflict)| `5`  | re-pull and reapply, or push `--force`   |
 | any command — bad usage                               | `2`  | usage error                              |
 | any command — generic failure / contract drift        | `1` / `3` | failure (see message)               |
 
@@ -146,6 +147,8 @@ claude-design pull <project_id> ./design/onboarding
 - Never deletes a local `PROVENANCE.md` / `CANONICAL.md` sidecar.
 - **Fails loudly** (non-zero exit) if any file hits the 256 KiB read cap — it
   reports which files and does **not** write a possibly-truncated copy.
+- Writes a `.etags` **base-index sidecar** (see below) recording the etag of
+  every file it pulls, so a later `push` can detect upstream changes.
 
 ### Push local changes up (UP mirror)
 
@@ -154,10 +157,32 @@ locally, then applies them as a single plan.
 
 ```bash
 claude-design push <project_id> ./design/onboarding
+claude-design push <project_id> ./design/onboarding --force   # last-write-wins
 ```
 
 - Never deletes tool-managed artifacts upstream (additive safety).
 - Flags any local file too large for an inline write (≥ 256 KiB).
+- **Conflict-safe when a `.etags` is present** (i.e. the dir came from a `pull`).
+  Each write is guarded with a per-file `if_match` equal to the etag recorded at
+  pull time; new files use a create-only sentinel. If the remote changed since
+  your last pull — a write whose etag moved, or a delete target whose etag moved
+  — the push is **refused atomically** (nothing is written), the conflicting
+  paths are named, and the CLI exits `5`. Re-pull and reapply, or pass `--force`.
+- After a successful push the `.etags` index is **refreshed** from the etags the
+  server returns, so consecutive pushes (without an intervening pull) work.
+- `--force` bypasses all conflict checks (omits `if_match`, skips the delete
+  guard) for explicit last-write-wins. It still refreshes `.etags`.
+
+### The `.etags` base-index sidecar
+
+`pull` writes a `.etags` file at the root of `<dir>`: a flat JSON map of
+`{ "<relative-path>": "<etag>" }` for every text file it mirrored, sourced from
+each file's `read_file` response (so the recorded etag exactly matches the bytes
+on disk). It is **CLI-local metadata and is never synced** — `push` never
+uploads it, `pull` never deletes it, and it is never indexed in itself. Its
+presence is what opts a directory into conflict-safe `push`; if it is absent
+(e.g. a hand-built dir that was never pulled), `push` falls back to the original
+last-write-wins behavior. You can commit it or `.gitignore` it as you prefer.
 
 ### Create a project
 
