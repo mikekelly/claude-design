@@ -21,7 +21,7 @@ import { startServer, printBanner } from './serve.mjs';
 const ENDPOINT = process.env.CLAUDE_DESIGN_MCP_URL || 'https://api.anthropic.com/v1/design/mcp';
 const PROTOCOL_VERSION = '2025-06-18';
 const READ_CAP = 256 * 1024; // 256 KiB
-const CLIENT = { name: 'claude-design', version: '0.1.2' };
+const CLIENT = { name: 'claude-design', version: '0.1.3' };
 
 // ---------------------------------------------------------------------------
 // OAuth — standalone design login.
