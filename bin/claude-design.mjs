@@ -16,7 +16,9 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { startServer, printBanner } from './serve.mjs';
 
-const ENDPOINT = 'https://api.anthropic.com/v1/design/mcp';
+// CLAUDE_DESIGN_MCP_URL exists only as a test seam (point the design MCP
+// endpoint at a local stub); production never sets it.
+const ENDPOINT = process.env.CLAUDE_DESIGN_MCP_URL || 'https://api.anthropic.com/v1/design/mcp';
 const PROTOCOL_VERSION = '2025-06-18';
 const READ_CAP = 256 * 1024; // 256 KiB
 const CLIENT = { name: 'claude-design', version: '0.1.2' };
@@ -456,9 +458,10 @@ class Session {
         )}`,
       );
     }
-    if (!init.sid) {
-      contractDrift('initialize returned no Mcp-Session-Id header');
-    }
+    // The endpoint may be stateless: a missing Mcp-Session-Id is fine — we
+    // proceed without one. When the server DOES return a sid we keep using and
+    // forwarding it (rpc() only sets the header when a sid is present), so this
+    // stays backward-compatible with the older stateful contract.
     const session = new Session(token, init.sid);
     await rpc(
       token,
